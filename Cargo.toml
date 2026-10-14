@@ -69,3 +69,8 @@ tracing-appender = "0.2.5"
 # Windows resource / manifest embedding for the app build script.
 embed-manifest = "1.5.1"
 winresource = "0.1.31"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
