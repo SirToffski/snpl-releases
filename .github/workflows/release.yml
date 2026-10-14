@@ -1,0 +1,121 @@
+# Builds snpl.exe for Windows x86_64 and publishes it as a GitHub Release.
+#
+# How to cut a release:
+#   1. Bump `version` in the root Cargo.toml (and the manifest's
+#      assemblyIdentity version) if you want the exe to report it.
+#   2. git tag v0.1.0 && git push origin v0.1.0
+# The workflow builds from that tag, runs the tests, and attaches:
+#   - snpl.exe                                  the program itself
+#   - snpl-<tag>-windows-x86_64.zip             the same exe zipped
+#   - SHA256SUMS.txt                            checksums of both
+# plus a signed build-provenance attestation, so anyone can check the exe was
+# built by this workflow from this repo:
+#   gh attestation verify snpl.exe --repo <owner>/<repo>
+#
+# "Run workflow" on the Actions tab (workflow_dispatch) builds and tests the
+# same way and uploads the files as a workflow artifact, without publishing a
+# release. Use it to check a build before tagging.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write       # create the release and upload its files
+  id-token: write       # sign the build-provenance attestation
+  attestations: write   # store the attestation
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-x86_64:
+    name: Build snpl.exe (Windows x86_64)
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+      # Smaller, reproducible-ish release builds; matches a local `cargo build --release`.
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@v5
+
+      - name: Install Rust (stable, MSVC)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the tests
+        run: cargo test --workspace --locked
+
+      - name: Build the release exe
+        run: cargo build --release --locked -p snp-ligase-app --target x86_64-pc-windows-msvc
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
+          $exe = "target/x86_64-pc-windows-msvc/release/snpl.exe"
+          if (-not (Test-Path $exe)) { throw "snpl.exe was not built" }
+
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $exe dist/snpl.exe
+
+          # The zip carries the exe plus any license/readme files the repo has.
+          $stage = "stage/snpl-$tag-windows-x86_64"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item $exe $stage/
+          Get-ChildItem -File -Path . | Where-Object { $_.Name -match '^(LICENSE|README)' } | Copy-Item -Destination $stage/
+          $zip = "dist/snpl-$tag-windows-x86_64.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip
+
+          # Checksums, in the format `sha256sum -c` understands.
+          Get-ChildItem dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          Get-Content dist/SHA256SUMS.txt
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/snpl.exe
+            dist/snpl-*.zip
+
+      - name: Upload the build (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: snpl-${{ steps.package.outputs.tag }}-windows-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish the GitHub Release (tag pushes)
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          name: snpl ${{ github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          body: |
+            Windows 10/11, x86_64. Download `snpl.exe` (or the zip) and run it; there is no installer.
+
+            **Windows SmartScreen** will warn that the publisher is unknown, because the exe is not code-signed. Choose "More info" → "Run anyway".
+
+            **Check the download** — every file here was built by this repository's GitHub Actions workflow from the tagged source:
+            - SHA-256: compare with `SHA256SUMS.txt` (`Get-FileHash snpl.exe` in PowerShell).
+            - Build provenance: `gh attestation verify snpl.exe --repo ${{ github.repository }}`

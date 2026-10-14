@@ -1,0 +1,71 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/snp-ligase-core",
+    "crates/snp-ligase-platform",
+    "crates/snp-ligase-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Shared dependency versions. Every crate takes its versions from here so the
+# whole workspace resolves to one copy of each crate.
+[workspace.dependencies]
+# Internal crates.
+snp-ligase-core = { path = "crates/snp-ligase-core" }
+snp-ligase-platform = { path = "crates/snp-ligase-platform" }
+
+# GUI.
+eframe = "0.36.2"
+egui = "0.36.2"
+
+# 2D rasterizer (CPU, anti-aliased paths).
+tiny-skia = "0.12.0"
+
+# Text shaping, layout and glyph rasterization.
+cosmic-text = "0.19.0"
+
+# Image buffers and codecs. The default feature set is off at the workspace
+# level so each member enables exactly the formats it uses; snp-ligase-core
+# owns the codec list of SPEC section 9.
+image = { version = "0.25.10", default-features = false }
+zune-jpegxl = "0.5.2"
+# zune-jpegxl's option types (EncoderOptions, ColorSpace, BitDepth) live here;
+# it is the same zune family and the same MIT/Apache-2.0/Zlib license.
+zune-core = "0.5.3"
+# AGPL-3.0. Only ever used behind the app's `jxl-lossy` feature, which is OFF by
+# default and must not be enabled without the human's approval (SPEC section 3).
+jxl-encoder = "0.3.1"
+jxl-oxide = "0.12.6"
+
+# Half floats, for HDR capture frames.
+half = "2.7.1"
+
+# Windows-specific crates (used by snp-ligase-platform and the app).
+windows-capture = "2.0.1"
+windows = "0.62.2"
+global-hotkey = "0.8.0"
+tray-icon = "0.26.1"
+arboard = "3.6.1"
+rfd = "0.17.2"
+
+# Configuration.
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+directories = "6.0.0"
+chrono = "0.4.45"
+
+# Errors and logging.
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+tracing-appender = "0.2.5"
+
+# Windows resource / manifest embedding for the app build script.
+embed-manifest = "1.5.1"
+winresource = "0.1.31"

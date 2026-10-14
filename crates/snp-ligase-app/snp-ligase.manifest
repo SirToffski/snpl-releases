@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="SirToffski.snpl"
+      version="0.1.0.0"
+      processorArchitecture="*"
+  />
+
+  <!-- Visual styles for the native bits of the UI (file dialogs, message boxes). -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="*"
+          publicKeyToken="6595b64144ccf1df"
+          language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!-- SPEC 5.2: the process MUST be Per-Monitor DPI Aware V2 so that every
+           Win32 coordinate it sees is in physical pixels in one shared
+           virtual-desktop space, on any mix of monitor scaling. -->
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+      <!-- Legacy declaration for OS versions that do not know the newer setting:
+           per-monitor aware, not system aware. -->
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <!-- Treat narrow strings as UTF-8 (SPEC section 5.2 style requirement). -->
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <!-- GDI scaling is deliberately off: the overlay and capture code work in
+           physical pixels and must never be scaled by the system. -->
+      <gdiScaling xmlns="http://schemas.microsoft.com/SMI/2017/WindowsSettings">false</gdiScaling>
+    </windowsSettings>
+  </application>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11. -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

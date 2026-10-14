@@ -1,0 +1,70 @@
+[package]
+name = "snp-ligase-app"
+description = "The snp-ligase executable: window shell, capture pipeline, annotation editor."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "snpl"
+path = "src/main.rs"
+
+[features]
+default = ["avif"]
+# The pure-Rust AVIF encoder inside snp-ligase-core's `image`, on by default
+# per SPEC section 9. Turning it off drops AVIF from the Save dialog too.
+avif = ["snp-ligase-core/avif"]
+# AGPL-3.0 lossy JPEG XL, forwarded to core. OFF by default; never enabled
+# without the human's approval (SPEC section 3).
+jxl-lossy = ["snp-ligase-core/jxl-lossy"]
+
+[dependencies]
+egui.workspace = true
+eframe.workspace = true
+anyhow.workspace = true
+directories.workspace = true
+tracing.workspace = true
+# env-filter: honour RUST_LOG. tracing-log: capture the `log` records that
+# eframe, winit and the Windows crates emit, so they land in our log file too.
+tracing-subscriber = { workspace = true, features = ["env-filter", "tracing-log"] }
+tracing-appender.workspace = true
+
+# The capture pipeline behind `--debug-capture`.
+snp-ligase-platform.workspace = true
+# capture.json. serde_json is MIT OR Apache-2.0, like serde itself.
+serde_json = "1.0"
+serde = { workspace = true, features = ["derive"] }
+# The settings file (SPEC section 10): toml is MIT OR Apache-2.0.
+toml.workspace = true
+# Writing monitor_<n>.png from the captured pixels: the buffer types and the
+# PNG encoder only.
+image = { workspace = true, default-features = false, features = ["png"] }
+# The core model, rendering and codecs the editor draws with.
+snp-ligase-core.workspace = true
+# Clipboard: copy a flattened image, paste one in (SPEC section 9).
+arboard.workspace = true
+# Global hotkeys (SPEC 6.1) and the tray icon (SPEC 6.1), both behind the M5
+# controller thread. Their event handlers only send on a channel; the capture
+# pipeline runs there, not in the egui frame (SPEC 6.2).
+global-hotkey.workspace = true
+tray-icon.workspace = true
+# Capture tab titles (`Capture HH:MM:SS`) and the default save name
+# `snap_%Y%m%d-%H%M%S` (SPEC 7.1 and 9).
+chrono.workspace = true
+# Native file dialogs for Open and Save As (SPEC section 9).
+rfd.workspace = true
+# Only used in the one clearly-marked `#[cfg(windows)]` spot that borrows the
+# console for `--debug-capture` (SPEC section 0, rule 7). Everything else that
+# touches Windows lives in snp-ligase-platform.
+windows = { workspace = true, features = ["Win32_System_Console"] }
+
+[build-dependencies]
+embed-manifest.workspace = true
+winresource.workspace = true
+
+[dev-dependencies]
+# Headless UI tests for widget behaviour pure functions cannot reach (SPEC
+# section 3 lists it; NEXT_STEPS section 1.3). The version matches egui
+# exactly. No `wgpu`/snapshot features: these tests only click and read.
+egui_kittest = "0.36.2"

@@ -1,0 +1,46 @@
+[package]
+name = "snp-ligase-platform"
+description = "The OS boundary of snp-ligase: the Platform trait and its Windows implementation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The HDR maths lives in core, which is pure Rust and can be unit tested on any
+# machine (SPEC section 5.5). This direction matters: core never depends on us.
+snp-ligase-core = { workspace = true }
+
+# f16 -> f32 for the Rgba16F frames Windows.Graphics.Capture hands us.
+half.workspace = true
+
+# Every capture is logged with monitor metadata (SPEC section 0, rule 11).
+tracing.workspace = true
+
+# capture.json holds MonitorInfo and FrameDiagnostics, so those derive Serialize.
+serde = { workspace = true, features = ["derive"] }
+
+# Only the buffer types are used here; the codecs live in snp-ligase-core.
+image = { workspace = true, default-features = false }
+thiserror.workspace = true
+
+# Windows APIs. Only the features actually used are enabled. All of the `windows`
+# crate usage in the project lives in this crate (SPEC section 0, rule 7).
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Devices_Display",        # QueryDisplayConfig / DisplayConfigGetDeviceInfo (SDR white level)
+    "Win32_Graphics_Dwm",           # DWMWA_EXTENDED_FRAME_BOUNDS for the active-window rect
+    "Win32_Graphics_Dxgi",          # adapter/output enumeration, HDR colour space
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",           # GDI fallback capture (BitBlt), monitor info
+    "Win32_UI_HiDpi",               # GetDpiForMonitor
+    "Win32_UI_Input_KeyboardAndMouse", # GetAsyncKeyState, the overlay's mouse capture
+    "Win32_UI_WindowsAndMessaging", # MONITORINFOF_PRIMARY, the overlay windows, hotkey registration
+    "Win32_System_LibraryLoader",   # GetModuleHandleW for the overlay's window class
+    "Win32_System_SystemInformation", # GetTickCount64 for the self-check's idle guard
+    "Win32_System_Threading",       # CreateMutexW, AttachThreadInput
+    "Win32_Security",               # SECURITY_ATTRIBUTES for CreateMutexW
+] }
+
+# Windows.Graphics.Capture wrapper (SPEC section 3).
+windows-capture.workspace = true

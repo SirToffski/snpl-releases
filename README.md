@@ -1,0 +1,1 @@
+This is my personal app for taking and annotating screenshots. It takes screenshots, and it annotates them. Meaningless icons are replaced with text, so I don't need to guess what each button does. If you want to learn more, point your favourite LLM here and ask it to explain.

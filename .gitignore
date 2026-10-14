@@ -1,0 +1,4 @@
+/target
+# Source artwork (full-size originals); assets/ holds what the repo and build use.
+/icon.png
+/icon-hippo.jpg

@@ -1,0 +1,61 @@
+[package]
+name = "snp-ligase-core"
+description = "Pure-Rust core of snp-ligase: geometry, annotation model, rendering, codecs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["avif"]
+# The pure-Rust AVIF encoder inside `image` (ravif), on by default per SPEC
+# section 9. Turning it off drops the format from `codec::Format::ALL`, so it
+# disappears from the Save dialog too.
+avif = ["image/avif", "image/rayon"]
+# AGPL-3.0. Only ever used behind this feature, which is OFF by default and must
+# not be enabled without the human's approval (SPEC section 3).
+jxl-lossy = ["dep:jxl-encoder"]
+
+[dependencies]
+# f16 -> f32, for the Rgba16F frames that Windows.Graphics.Capture hands us.
+half.workspace = true
+# Error enums for this library crate (SPEC section 0, rule 10).
+thiserror.workspace = true
+# The model types derive Serialize/Deserialize (SPEC section 4).
+serde.workspace = true
+# Every annotation is rasterized into a small premultiplied RGBA pixmap.
+tiny-skia.workspace = true
+# Image buffers and the codecs of SPEC section 9. The default feature set is
+# off on purpose: each format this build can write is listed, and AVIF is the
+# one that comes through the `avif` cargo feature above.
+image = { workspace = true, default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+    "bmp",
+] }
+# JPEG XL lossless encode (SPEC section 9's default JXL encoder).
+zune-jpegxl.workspace = true
+# `EncoderOptions`, `ColorSpace` and `BitDepth` for the encoder above.
+zune-core.workspace = true
+# JPEG XL decode, with its `image` integration (JxlDecoder implements
+# `image::ImageDecoder`, which is how a decoded frame becomes an RgbaImage).
+jxl-oxide = { workspace = true, features = ["image"] }
+# JPEG XL lossy encode: AGPL-3.0, behind the `jxl-lossy` feature, off by
+# default. Never enabled without the human's approval (SPEC section 3).
+jxl-encoder = { workspace = true, optional = true }
+# Warnings, e.g. when a font family is missing (SPEC section 4.2).
+tracing.workspace = true
+# Text shaping, layout and glyph rasterization for Text and Number (SPEC
+# sections 2 and 4.2; M4).
+cosmic-text.workspace = true
+
+# Still free of GUI, windowing and OS crates: `half`, `thiserror`, `serde`,
+# `tiny-skia`, `image` and `tracing` are all pure Rust. The rule is not "zero
+# dependencies", it is "nothing that touches the screen".
+
+[dev-dependencies]
+# Tests round-trip documents and images through JSON.
+serde_json = "1.0"
+
