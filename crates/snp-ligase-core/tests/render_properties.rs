@@ -10,7 +10,8 @@ use image::{Rgba, RgbaImage};
 use snp_ligase_core::edit;
 use snp_ligase_core::geom::{Point, Rect};
 use snp_ligase_core::model::{
-    Annotation, ImageA, Kind, PathA, PolygonA, RectA, Rgba as ModelRgba, Stroke, TextA, defaults,
+    Annotation, FreehandA, ImageA, Kind, PathA, PolygonA, RectA, Rgba as ModelRgba, Stroke, TextA,
+    defaults,
 };
 use snp_ligase_core::render;
 use snp_ligase_core::text::Fonts;
@@ -945,6 +946,247 @@ fn a_highlight_over_a_pasted_image_multiplies_its_pixels() {
     assert_eq!(flattened.get_pixel(15, 10), &Rgba(BLUE));
 }
 
+/// A stand-in for a pasted screenshot with a hard edge every six pixels: a blur
+/// is easy to see on it and a highlight's multiply is easy to check (NEXT_STEPS
+/// step 12).
+fn stripes(width: u32, height: u32) -> RgbaImage {
+    RgbaImage::from_fn(width, height, |x, _y| {
+        if (x / 6) % 2 == 0 {
+            Rgba([0, 0, 0, 255])
+        } else {
+            Rgba([255, 255, 255, 255])
+        }
+    })
+}
+
+/// A base image with `stripes` pasted `gap` pixels to the right of it, plus
+/// `annotation` on top — the layout step 12 is about (NEXT_STEPS K1).
+fn stitched(gap: u32, annotation: Annotation) -> snp_ligase_core::model::Document {
+    let mut doc = snp_ligase_core::model::Document::new(base(80, 40));
+    doc.push(Kind::Image(ImageA {
+        pos: Point::new(80.0 + gap as f32, 0.0),
+        image: Arc::new(stripes(60, 40)),
+    }));
+    doc.annotations.push(annotation);
+    doc
+}
+
+#[test]
+fn a_blur_over_a_pasted_image_beside_the_base_blurs_its_pixels() {
+    // NEXT_STEPS step 12, K1: the normal stitching case is a screenshot pasted
+    // *next to* the original. A Blur dragged over the pasted pixels used to do
+    // nothing there, because the layer it reads stopped at the original.
+    let mut doc = stitched(
+        20,
+        Annotation {
+            id: 2,
+            shadow: false,
+            kind: Kind::Blur(snp_ligase_core::model::BlurA {
+                rect: Rect::new(100.0, 0.0, 60.0, 40.0),
+                radius: 8.0,
+            }),
+        },
+    );
+
+    let expanded = expand(&doc, Some(WHITE));
+    // Local x = 5 of the pasted image is the last column of a black stripe:
+    // sharp black before the fix, a black-to-white ramp with it.
+    let value = expanded.get_pixel(105, 20)[0];
+    assert!(
+        value > 0 && value < 255,
+        "the blur did not touch the pasted image: {value}"
+    );
+
+    // The control: without the blur the same pixel is the sharp black.
+    doc.annotations.pop();
+    let sharp = expand(&doc, Some(WHITE));
+    assert_eq!(sharp.get_pixel(105, 20), &Rgba([0, 0, 0, 255]));
+}
+
+#[test]
+fn a_blur_over_a_pasted_image_left_of_and_above_the_base_blurs_its_pixels() {
+    // Step 12 review: the layer's origin is negative when a screenshot is
+    // pasted to the left of or above the original. The pasted pixels must land
+    // at the right place in the layer the Blur reads, or the blur reads empty
+    // pixels and the pasted content stays readable.
+    let mut doc = snp_ligase_core::model::Document::new(base(80, 40));
+    doc.push(Kind::Image(ImageA {
+        pos: Point::new(-80.0, -10.0),
+        image: Arc::new(stripes(60, 40)),
+    }));
+    doc.push(Kind::Blur(snp_ligase_core::model::BlurA {
+        rect: Rect::new(-75.0, -5.0, 50.0, 30.0),
+        radius: 8.0,
+    }));
+
+    let expanded = expand(&doc, Some(WHITE));
+    // The export starts at the pasted image's corner (-80, -10). Image point
+    // (-75, 10) is local column 5 of the stripes, the last column of a black
+    // stripe: sharp black when the blur misses, a black-to-white ramp when it
+    // works.
+    let value = expanded.get_pixel(5, 20)[0];
+    assert!(
+        value > 0 && value < 255,
+        "the blur did not touch the pasted image left of the base: {value}"
+    );
+}
+
+#[test]
+fn a_highlight_over_a_pasted_image_beside_the_base_multiplies_its_pixels() {
+    // NEXT_STEPS step 12: the same case for a Highlight, and an exact value:
+    // black × yellow stays black, white × yellow is yellow.
+    let mut doc = snp_ligase_core::model::Document::new(base(80, 40));
+    doc.push(Kind::Image(ImageA {
+        pos: Point::new(100.0, 0.0),
+        image: Arc::new(RgbaImage::from_pixel(60, 40, Rgba([255, 255, 255, 255]))),
+    }));
+    doc.push(Kind::Highlight(snp_ligase_core::model::HighlightA {
+        rect: Rect::new(100.0, 0.0, 60.0, 40.0),
+        color: YELLOW,
+    }));
+
+    let expanded = expand(&doc, Some(WHITE));
+    assert_eq!(
+        expanded.get_pixel(130, 20),
+        &Rgba([255, 255, 0, 255]),
+        "the highlight did not multiply the pasted pixels"
+    );
+}
+
+#[test]
+fn a_blur_across_the_seam_of_base_and_pasted_image_is_continuous() {
+    // NEXT_STEPS step 12: the two images are one layer, so a blur that reaches
+    // over the seam must not show it. Before the fix the pasted side of the
+    // seam was not blurred at all, which is a 255-step jump on this scene.
+    let mut doc = snp_ligase_core::model::Document::new(base(80, 40));
+    doc.push(Kind::Image(ImageA {
+        pos: Point::new(80.0, 0.0),
+        image: Arc::new(RgbaImage::from_pixel(40, 40, Rgba([0, 0, 0, 255]))),
+    }));
+    doc.push(Kind::Blur(snp_ligase_core::model::BlurA {
+        rect: Rect::new(70.0, 0.0, 30.0, 40.0),
+        radius: 8.0,
+    }));
+
+    let expanded = expand(&doc, Some(WHITE));
+    // The seam sits at x = 80: the pasted image starts there. A blurred
+    // neighbourhood changes gently from column to column; the sharp pasted
+    // pixels change by 255. 40 is far from both.
+    for y in 0..40 {
+        let left = i32::from(expanded.get_pixel(79, y)[0]);
+        let right = i32::from(expanded.get_pixel(80, y)[0]);
+        assert!(
+            (left - right).abs() < 40,
+            "a hard edge at the seam on row {y}: {left} then {right}"
+        );
+    }
+    // And the seam is really inside the blur: black and white meet in a ramp.
+    let seam = expanded.get_pixel(80, 20)[0];
+    assert!(
+        seam > 0 && seam < 255,
+        "the seam was not blurred at all: {seam}"
+    );
+}
+
+#[test]
+fn a_blur_over_the_gap_between_the_base_and_a_pasted_image_leaves_the_fill_alone() {
+    // NEXT_STEPS step 12, J1: the layer covers the base and the pasted images,
+    // and nothing in between. A blur that reaches over the gap must blur what
+    // it touches and leave the fill colour of the empty part alone.
+    let doc = stitched(
+        40,
+        Annotation {
+            id: 2,
+            shadow: false,
+            kind: Kind::Blur(snp_ligase_core::model::BlurA {
+                rect: Rect::new(90.0, 0.0, 60.0, 40.0),
+                radius: 8.0,
+            }),
+        },
+    );
+
+    let expanded = expand(&doc, Some(WHITE));
+    for y in 0..40 {
+        for x in 90..120 {
+            assert_eq!(
+                expanded.get_pixel(x, y),
+                &Rgba(WHITE),
+                "the blur painted the added area at ({x}, {y})"
+            );
+        }
+    }
+    // The pasted pixels the same blur reaches are blurred (local x = 5).
+    let value = expanded.get_pixel(125, 20)[0];
+    assert!(
+        value > 0 && value < 255,
+        "the blur did not reach the pasted image: {value}"
+    );
+}
+
+#[test]
+fn the_layer_a_sprite_is_made_from_gives_the_same_pixels_as_the_export() {
+    // NEXT_STEPS step 12: the canvas rasterizes a Blur against the same layer
+    // `flatten_with` composites, so the screen and the saved file agree. One
+    // sprite's pixels are exactly the export's pixels where it is opaque.
+    let doc = stitched(
+        20,
+        Annotation {
+            id: 2,
+            shadow: false,
+            kind: Kind::Blur(snp_ligase_core::model::BlurA {
+                rect: Rect::new(100.0, 0.0, 60.0, 40.0),
+                radius: 8.0,
+            }),
+        },
+    );
+
+    let mut fonts = Fonts::bundled();
+    let layer = render::images_base(&doc, &mut fonts, true);
+    let sprite = render::rasterize_layer(&doc.annotations[1], &layer, &mut fonts)
+        .expect("the pasted image has a blur sprite");
+    assert_eq!(sprite.origin, (100, 0));
+
+    let exported = expand(&doc, Some(WHITE));
+    for row in 0..sprite.pixmap.height() {
+        for column in 0..sprite.pixmap.width() {
+            let at = (row as usize * sprite.pixmap.width() as usize + column as usize) * 4;
+            let pixel = &sprite.pixmap.data()[at..at + 4];
+            assert_eq!(pixel[3], 255, "an effect sprite is opaque");
+            let (x, y) = (100 + column, row);
+            assert_eq!(
+                &exported.get_pixel(x, y).0[..3],
+                &pixel[..3],
+                "the canvas sprite and the export disagree at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn cut_mode_still_stops_the_layer_at_the_base_image() {
+    // NEXT_STEPS step 12: all the old goldens stay byte-identical because Cut
+    // mode keeps the base-sized layer. A blur over a pasted image outside the
+    // base does nothing there, which is what "cut off at the image edge" means.
+    let doc = stitched(
+        20,
+        Annotation {
+            id: 2,
+            shadow: false,
+            kind: Kind::Blur(snp_ligase_core::model::BlurA {
+                rect: Rect::new(100.0, 0.0, 60.0, 40.0),
+                radius: 8.0,
+            }),
+        },
+    );
+
+    let cut = render::flatten(&doc, &mut Fonts::bundled());
+    assert_eq!((cut.width(), cut.height()), (80, 40));
+    assert!(
+        cut.pixels().all(|pixel| pixel.0 == WHITE),
+        "the pasted image or its blur leaked into the Cut export"
+    );
+}
+
 #[test]
 fn a_pasted_image_beside_the_base_grows_the_export() {
     // Step 11's expansion: pasting to the right of the image grows the saved
@@ -1342,4 +1584,97 @@ fn painted_bounds_follow_the_pixels_not_the_sprite_canvas() {
             bottom: 60
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// Freehand strokes (NEXT_STEPS step 14a).
+
+/// One freehand stroke: the points from (x, y) pairs, one stroke style.
+fn freehand(points: &[(f32, f32)], width: f32, colour: ModelRgba) -> Kind {
+    Kind::Freehand(FreehandA {
+        points: points.iter().map(|&(x, y)| Point::new(x, y)).collect(),
+        stroke: Stroke {
+            color: colour,
+            width,
+        },
+    })
+}
+
+#[test]
+fn a_freehand_stroke_paints_along_its_points() {
+    let image = flatten_with(
+        base(60, 60),
+        vec![annotation(freehand(
+            &[(10.0, 20.0), (50.0, 20.0)],
+            8.0,
+            RED,
+        ))],
+    );
+
+    assert_eq!(image.get_pixel(30, 20), &Rgba(RED), "on the stroke");
+    assert_eq!(image.get_pixel(20, 20), &Rgba(RED), "on the stroke");
+    // Well away from the line: the base is untouched.
+    assert_eq!(image.get_pixel(30, 5), &Rgba([255, 255, 255, 255]));
+    assert_eq!(image.get_pixel(30, 40), &Rgba([255, 255, 255, 255]));
+}
+
+#[test]
+fn a_freehand_stroke_that_overlaps_itself_is_painted_once() {
+    // NEXT_STEPS step 14a: the stroke is **one** stroked path, so a
+    // translucent stroke must not darken where it crosses itself. Going out
+    // and back over the same pixels is the worst case for blending twice.
+    let translucent = |points: &[(f32, f32)]| annotation(freehand(points, 12.0, [255, 0, 0, 128]));
+
+    let once = flatten_with(
+        base(60, 30),
+        vec![translucent(&[(10.0, 15.0), (50.0, 15.0)])],
+    );
+    let twice = flatten_with(
+        base(60, 30),
+        vec![translucent(&[(10.0, 15.0), (50.0, 15.0), (10.0, 15.0)])],
+    );
+
+    assert_eq!(
+        twice.get_pixel(30, 15),
+        once.get_pixel(30, 15),
+        "the overlap was blended twice"
+    );
+}
+
+#[test]
+fn a_freehand_stroke_covers_half_its_width_on_each_side_of_the_line() {
+    // NEXT_STEPS step 14a: the shape's rectangle is the polyline grown by half
+    // the stroke width, and `bounds` adds the anti-aliasing slack on top.
+    let mut fonts = Fonts::bundled();
+    let stroke = annotation(freehand(&[(10.0, 20.0), (50.0, 20.0)], 8.0, RED));
+
+    let shape = render::shape_bounds(&stroke, &mut fonts);
+    assert_eq!(shape, Rect::new(6.0, 16.0, 48.0, 8.0));
+    assert_eq!(render::bounds(&stroke, &mut fonts), shape.inflated(2.0));
+}
+
+#[test]
+fn a_freehand_stroke_outside_the_image_grows_the_export() {
+    // NEXT_STEPS step 14a: a stroke is an ordinary annotation, so its painted
+    // pixels grow the export like any other (J2).
+    let mut doc = snp_ligase_core::model::Document::new(RgbaImage::from_pixel(60, 60, Rgba(BLACK)));
+    doc.push(freehand(&[(-40.0, 30.0), (-5.0, 30.0)], 8.0, RED));
+
+    let export = render::export_bounds(&doc, &mut Fonts::bundled());
+    assert!(
+        export.x < 0,
+        "a stroke left of the image must grow the export: {export:?}"
+    );
+
+    let expanded = expand(&doc, Some(WHITE));
+    assert_eq!(
+        (expanded.width(), expanded.height()),
+        (export.width(), export.height())
+    );
+    // The middle of the stroke, at its image position plus the export offset.
+    let offset = (-export.x) as u32;
+    assert_eq!(expanded.get_pixel(offset - 22, 30), &Rgba(RED));
+    // In the area the stroke added, but away from it, it is the bare fill: a
+    // stroke is not part of the base layer the effects read.
+    assert_eq!(expanded.get_pixel(offset - 30, 5), &Rgba(WHITE));
 }

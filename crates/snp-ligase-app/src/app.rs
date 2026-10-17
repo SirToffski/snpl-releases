@@ -1116,8 +1116,12 @@ impl SnpLigaseApp {
     }
 
     /// Adds a tab and makes it active.
-    fn push_tab(&mut self, tab: Tab) {
+    fn push_tab(&mut self, mut tab: Tab) {
         self.settle_edits();
+        // A new tab takes the setting (NEXT_STEPS step 13). This is the one
+        // place tabs enter the app, so a capture, a paste, Ctrl+O and a
+        // dropped file all agree.
+        tab.auto_fit = self.settings.settings().auto_fit_to_window;
         self.tabs.push(tab);
         self.set_active(self.tabs.len() - 1);
     }
@@ -1642,6 +1646,9 @@ impl SnpLigaseApp {
     // ---------------------------------------------------------------------
 
     /// Multiplies the zoom, keeping the middle of the canvas fixed.
+    ///
+    /// A manual zoom, so it stands auto-fit down for this tab (NEXT_STEPS
+    /// step 13).
     fn zoom(&mut self, factor: f32) {
         let canvas = self.canvas;
         let flatten = self.settings.settings().flatten_options();
@@ -1649,8 +1656,10 @@ impl SnpLigaseApp {
         let (Some(tab), Some(content)) = (self.active_tab(), content) else {
             return;
         };
+        tab.user_zoomed();
         let centre = pos2(canvas.x / 2.0, canvas.y / 2.0);
         tab.viewport.zoom_around(factor, centre, content, canvas);
+        tracing::debug!(target: "snp_ligase::ui", factor, zoom = tab.viewport.zoom, "zoomed");
     }
 
     /// The rectangle the view may pan and zoom over for the tab at `index`:
@@ -1824,17 +1833,47 @@ impl SnpLigaseApp {
                 let flatten = self.settings.settings().flatten_options();
                 let content = self.viewport_content(flatten.expand);
                 if let (Some(tab), Some(content)) = (self.active_tab(), content) {
+                    tab.user_zoomed();
                     tab.viewport.actual_size(content, canvas);
                     self.report("100%.");
                 }
             }
+            // Ctrl+1 both fits and re-arms auto-fit for this tab (NEXT_STEPS
+            // step 13), so a manual zoom can be undone from the View menu or
+            // the keyboard.
             Action::FitToWindow => {
                 let canvas = self.canvas;
                 let flatten = self.settings.settings().flatten_options();
                 let content = self.viewport_content(flatten.expand);
                 if let (Some(tab), Some(content)) = (self.active_tab(), content) {
+                    tab.auto_fit = true;
                     tab.viewport.fit(content, canvas, 16.0);
+                    // The fit is what auto-fit would have done, so record it:
+                    // without this the next frame would see "not fitted to
+                    // this layout" and fit again, undoing the upscale a small
+                    // image gets from Ctrl+1.
+                    tab.viewport.fitted_to =
+                        Some(crate::viewport::FittedLayout { canvas, content });
                     self.report("Fitted to the window.");
+                }
+            }
+            // View > Auto-fit to Window (NEXT_STEPS step 13).
+            Action::AutoFit(value) => {
+                let canvas = self.canvas;
+                let flatten = self.settings.settings().flatten_options();
+                let content = self.viewport_content(flatten.expand);
+                if let (Some(tab), Some(content)) = (self.active_tab(), content) {
+                    tab.auto_fit = value;
+                    if value {
+                        // Turning it on fits now, so the row's effect is
+                        // visible at once rather than at the next resize.
+                        tab.viewport.fit_for_auto_fit(content, canvas);
+                    }
+                    self.report(if value {
+                        "Auto-fit to the window on."
+                    } else {
+                        "Auto-fit to the window off; the zoom stays where it is."
+                    });
                 }
             }
             Action::ShowToolLabels(value) => {
@@ -2512,6 +2551,9 @@ impl SnpLigaseApp {
             tool: self.tool,
             show_properties: self.show_properties,
             show_tool_labels: self.show_tool_labels,
+            // The View menu's Auto-fit check shows the active tab's state
+            // (NEXT_STEPS step 13); with no tab open it shows off.
+            auto_fit: tab.is_some_and(|tab| tab.auto_fit),
             fonts_ready: self.fonts_ready(),
             delay_seconds: self.delay_seconds,
             active_tab: self.active,
@@ -2600,6 +2642,7 @@ impl SnpLigaseApp {
             canvas::CanvasFrame {
                 drawing_from,
                 polygon: self.gesture.polygon_points(),
+                freehand: self.gesture.freehand_points(),
                 crop: self.gesture.crop_rect(),
                 active_point,
                 moving: self.gesture.is_moving(),
@@ -2649,7 +2692,13 @@ impl SnpLigaseApp {
         // active". The Text tool is not here: its gesture ends in
         // `Gesture::TextEdit`, which becomes a session, and the switch happens
         // when that session commits a new annotation (9b).
-        let was_drag_drawing = matches!(self.gesture, Gesture::Drawing { .. });
+        //
+        // The Freehand stroke (NEXT_STEPS step 14b) behaves like the other
+        // drag tools, so its release frame is its end too.
+        let was_drag_drawing = matches!(
+            self.gesture,
+            Gesture::Drawing { .. } | Gesture::Freehand { .. }
+        );
         let was_click_drawing = matches!(
             self.gesture,
             Gesture::Polygon { .. } | Gesture::NumberDrag { .. }
@@ -3533,6 +3582,16 @@ mod tests {
             image_pointer: Some(at),
             primary_down: true,
             ..CanvasInput::default()
+        }
+    }
+
+    /// A Freehand move frame: the pointer at `at`, plus every position egui
+    /// reported this frame (NEXT_STEPS step 14b: a fast stroke arrives as
+    /// several events in one frame).
+    fn stroke_to(at: Point, samples: &[Point]) -> CanvasInput {
+        CanvasInput {
+            pointer_samples: samples.to_vec(),
+            ..drag_to(at)
         }
     }
 
@@ -5159,6 +5218,61 @@ mod tests {
         );
     }
 
+    /// NEXT_STEPS step 14b: the whole stroke is one annotation and one undo
+    /// step, and every move event of a frame is part of it.
+    #[test]
+    fn a_freehand_stroke_is_one_annotation_and_one_undo_step() {
+        let mut app = app_with_unsaved(1);
+        app.tool = Tool::Freehand;
+
+        let _ = app.canvas_input(&press_at(Point::new(10.0, 10.0)));
+        let _ = app.canvas_input(&stroke_to(
+            Point::new(200.0, 10.0),
+            &[
+                Point::new(80.0, 10.0),
+                Point::new(140.0, 10.0),
+                Point::new(200.0, 10.0),
+            ],
+        ));
+        let _ = app.canvas_input(&release_at(Point::new(200.0, 10.0)));
+
+        assert_eq!(app.tabs[0].document.annotations.len(), 1);
+        let Kind::Freehand(stroke) = &app.tabs[0].document.annotations[0].kind else {
+            panic!("expected a freehand stroke");
+        };
+        assert_eq!(stroke.points.first(), Some(&Point::new(10.0, 10.0)));
+        assert_eq!(stroke.points.last(), Some(&Point::new(200.0, 10.0)));
+        assert_eq!(app.tabs[0].undo_depth_for_test(), 1, "not one undo step");
+        assert!(!app.gesture.is_active());
+    }
+
+    /// NEXT_STEPS step 14b: Esc cancels the stroke under way, and the release
+    /// that follows adds nothing.
+    #[test]
+    fn an_escape_cancels_a_freehand_stroke() {
+        let mut app = app_with_unsaved(1);
+        app.tool = Tool::Freehand;
+
+        let _ = app.canvas_input(&press_at(Point::new(10.0, 10.0)));
+        let _ = app.canvas_input(&stroke_to(
+            Point::new(150.0, 60.0),
+            &[Point::new(150.0, 60.0)],
+        ));
+        app.run(Action::CancelGesture);
+        assert!(!app.gesture.is_active(), "Esc left the stroke under way");
+        let _ = app.canvas_input(&release_at(Point::new(150.0, 60.0)));
+
+        assert!(
+            app.tabs[0].document.annotations.is_empty(),
+            "Esc left a stroke behind"
+        );
+        assert_eq!(
+            app.tabs[0].undo_depth_for_test(),
+            0,
+            "a cancelled stroke cost an undo step"
+        );
+    }
+
     #[test]
     fn switching_to_select_after_drawing_is_the_setting() {
         let draw = |app: &mut SnpLigaseApp| {
@@ -5193,6 +5307,34 @@ mod tests {
         second.settings.replace(settings);
         draw(&mut second);
         assert_eq!(second.tool, Tool::Rectangle, "the setting was off");
+
+        // NEXT_STEPS step 14b: the Freehand stroke is a drag gesture too, so
+        // its release hands the pointer back like any other drawing tool's.
+        let mut third = app();
+        third.push_tab(Tab::new(
+            Document::new(RgbaImage::new(200, 200)),
+            "test".to_owned(),
+        ));
+        let mut settings = third.settings.settings().clone();
+        settings.switch_to_select_after_drawing = true;
+        third.settings.replace(settings);
+        third.tool = Tool::Freehand;
+        let _ = third.canvas_input(&press_at(Point::new(10.0, 10.0)));
+        let _ = third.canvas_input(&stroke_to(
+            Point::new(80.0, 10.0),
+            &[Point::new(80.0, 10.0)],
+        ));
+        let _ = third.canvas_input(&release_at(Point::new(80.0, 10.0)));
+        assert_eq!(
+            third.tool,
+            Tool::Select,
+            "a finished freehand stroke left the pointer on Freehand"
+        );
+        assert_eq!(
+            third.tabs[0].document.annotations.len(),
+            1,
+            "the stroke itself was lost"
+        );
     }
 
     /// NEXT_STEPS step 9b: the Text tool's gesture ends in `Gesture::TextEdit`,
@@ -5997,6 +6139,154 @@ mod tests {
             app.status.contains("larger than the 32 px texture limit"),
             "the status bar does not explain: {}",
             app.status
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-fit to the window (NEXT_STEPS step 13)
+    // -----------------------------------------------------------------------
+
+    /// A tab whose 2000 × 1500 image does not fit the 800 × 600 canvas the app
+    /// reports before a real frame has run.
+    fn app_with_a_big_tab() -> SnpLigaseApp {
+        let mut app = app();
+        app.add_capture(RgbaImage::new(2000, 1500));
+        app
+    }
+
+    /// NEXT_STEPS step 13: a new tab starts with auto-fit equal to the setting.
+    #[test]
+    fn a_new_tab_takes_the_auto_fit_setting() {
+        let mut app = app();
+        let mut settings = app.settings.settings().clone();
+        settings.auto_fit_to_window = false;
+        app.settings.replace(settings);
+
+        app.add_capture(RgbaImage::new(64, 64));
+
+        assert!(
+            !app.tabs[0].auto_fit,
+            "a tab opened with the setting off must not auto-fit"
+        );
+    }
+
+    /// NEXT_STEPS step 13: every manual zoom turns auto-fit off, for the tab it
+    /// zoomed and no other. The Ctrl+wheel path is covered in `tools`.
+    #[test]
+    fn every_manual_zoom_turns_auto_fit_off_for_that_tab_only() {
+        for action in [Action::ZoomIn, Action::ZoomOut, Action::ActualSize] {
+            let mut app = app_with_a_big_tab();
+            app.add_capture(RgbaImage::new(2000, 1500));
+            app.active = 0;
+
+            app.run(action.clone());
+
+            assert!(
+                !app.tabs[0].auto_fit,
+                "{action:?} left auto-fit on for the tab it zoomed"
+            );
+            assert!(
+                app.tabs[1].auto_fit,
+                "{action:?} turned auto-fit off in the other tab too"
+            );
+        }
+    }
+
+    /// NEXT_STEPS step 13: Ctrl+1 and the View menu's row re-arm auto-fit and
+    /// fit immediately; the row's off side just stands it down.
+    #[test]
+    fn fit_to_window_and_the_view_toggle_re_arm_auto_fit() {
+        let mut app = app_with_a_big_tab();
+        app.tabs[0].auto_fit = false;
+        app.tabs[0].viewport.zoom = 3.0;
+
+        app.run(Action::FitToWindow);
+
+        assert!(app.tabs[0].auto_fit, "Ctrl+1 did not re-arm auto-fit");
+        assert!(
+            app.tabs[0].viewport.zoom < 1.0,
+            "Ctrl+1 did not fit the 2000 px image: {}",
+            app.tabs[0].viewport.zoom
+        );
+        assert!(
+            app.tabs[0].viewport.fitted_to.is_some(),
+            "Ctrl+1 did not record what it fitted, so the next frame would fit again"
+        );
+
+        // View > Auto-fit to Window, off...
+        app.run(Action::AutoFit(false));
+        assert!(
+            !app.tabs[0].auto_fit,
+            "the View row did not turn auto-fit off"
+        );
+
+        // ...and on again: it fits now.
+        app.tabs[0].viewport.zoom = 3.0;
+        app.run(Action::AutoFit(true));
+        assert!(
+            app.tabs[0].auto_fit,
+            "the View row did not turn auto-fit on"
+        );
+        assert!(
+            app.tabs[0].viewport.zoom < 1.0,
+            "turning auto-fit on did not fit: {}",
+            app.tabs[0].viewport.zoom
+        );
+        assert!(
+            app.tabs[0].viewport.fitted_to.is_some(),
+            "turning auto-fit on did not record what it fitted"
+        );
+    }
+
+    /// NEXT_STEPS step 13 through the real canvas in a real frame: a resized
+    /// window re-fits while auto-fit is on, a manual zoom stands it down, and
+    /// Ctrl+1 arms it again.
+    #[test]
+    fn a_window_resize_re_fits_only_while_auto_fit_is_on() {
+        let app = app_with_a_big_tab();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 1000.0))
+            .build_ui_state(|ui, app: &mut SnpLigaseApp| app.frame_ui(ui), app);
+        harness.run();
+        let fitted = harness.state().tabs[0].viewport.zoom;
+        assert!(fitted < 1.0, "the 2000 px image was not fitted: {fitted}");
+
+        // A smaller window re-fits.
+        harness.set_size(egui::vec2(800.0, 700.0));
+        harness.run();
+        let smaller = harness.state().tabs[0].viewport.zoom;
+        assert!(
+            smaller < fitted,
+            "the resize did not re-fit: {fitted} -> {smaller}"
+        );
+
+        // A manual zoom stands auto-fit down, so the next resize leaves the
+        // view alone.
+        harness.state_mut().run(Action::ZoomIn);
+        harness.run();
+        let zoomed = harness.state().tabs[0].viewport.zoom;
+        harness.set_size(egui::vec2(600.0, 500.0));
+        harness.run();
+        assert_eq!(
+            harness.state().tabs[0].viewport.zoom,
+            zoomed,
+            "a resize moved the zoom after a manual zoom"
+        );
+
+        // Ctrl+1 re-arms it and fits; the next resize fits again.
+        harness.state_mut().run(Action::FitToWindow);
+        harness.run();
+        let refitted = harness.state().tabs[0].viewport.zoom;
+        assert!(
+            harness.state().tabs[0].auto_fit,
+            "Ctrl+1 did not re-arm auto-fit in the real frame"
+        );
+        harness.set_size(egui::vec2(1300.0, 950.0));
+        harness.run();
+        let bigger = harness.state().tabs[0].viewport.zoom;
+        assert!(
+            bigger > refitted,
+            "the resize after Ctrl+1 did not re-fit: {refitted} -> {bigger}"
         );
     }
 }

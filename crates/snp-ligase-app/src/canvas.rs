@@ -50,6 +50,13 @@ pub struct CanvasInput {
     pub pointer: Option<Pos2>,
     /// The same place as an image pixel.
     pub image_pointer: Option<Point>,
+    /// Every pointer position egui reported this frame, in image pixels
+    /// (NEXT_STEPS step 14b).
+    ///
+    /// egui can deliver several `Event::PointerMoved` in one frame, and the
+    /// Freehand tool needs all of them: keeping only [`Self::image_pointer`]
+    /// turns a fast stroke into a polygon at 60 fps.
+    pub pointer_samples: Vec<Point>,
     /// The left button went down **on this widget** this frame, and only on
     /// that frame.
     ///
@@ -102,6 +109,9 @@ pub struct CanvasFrame<'a> {
     pub polygon: Option<&'a [Point]>,
     /// The Crop tool's rectangle, drawn with its eight handles (SPEC 7.3).
     pub crop: Option<snp_ligase_core::geom::Rect>,
+    /// The Freehand stroke being drawn, for its preview (NEXT_STEPS step
+    /// 14b).
+    pub freehand: Option<&'a [Point]>,
     /// The picked-out point handle, drawn in its own colour (SPEC 7.3).
     pub active_point: Option<HandleKind>,
     /// True while the selection is being moved by the pointer (H4): only then
@@ -126,6 +136,7 @@ impl Default for CanvasFrame<'_> {
             drawing_from: None,
             polygon: None,
             crop: None,
+            freehand: None,
             active_point: None,
             moving: false,
             space_held: false,
@@ -155,6 +166,7 @@ pub fn show(
         drawing_from,
         polygon,
         crop,
+        freehand,
         active_point,
         moving,
         space_held,
@@ -183,6 +195,11 @@ pub fn show(
     let modifiers = ui.input(|input| input.modifiers);
     let zoom_delta = ui.input(|input| input.zoom_delta());
     let wheel = ui.input(|input| input.smooth_scroll_delta);
+    // NEXT_STEPS step 14b: everything the pointer reported this frame, not
+    // just where it ended up. The viewport is a plain copy, so the mapping can
+    // run inside the same pass over the events.
+    let viewport = tab.viewport;
+    let samples = ui.input(|input| samples_from_events(&input.events, &viewport));
 
     // A gesture follows the global pointer, so it keeps working when the drag
     // leaves the canvas and ends when the button comes up out there (R16).
@@ -190,6 +207,7 @@ pub fn show(
     let input = CanvasInput {
         pointer,
         image_pointer: pointer.map(|pos| tab.viewport.to_image(pos)),
+        pointer_samples: samples,
         primary_pressed: pointer_state.primary_pressed() && response.is_pointer_button_down_on(),
         primary_released: pointer_state.primary_released(),
         primary_down: pointer_state.primary_down(),
@@ -211,8 +229,26 @@ pub fn show(
     // scrolled to (NEXT_STEPS step 10).
     if !tab.viewport.initialised {
         tab.viewport.initialised = true;
-        tab.viewport.fit_if_larger(content, available);
+        tab.viewport.fit_for_auto_fit(content, available);
     } else {
+        // NEXT_STEPS step 13: with auto-fit on, the same fit runs again when
+        // the canvas (a window resize, the properties panel, a DPI change) or
+        // the content (a crop, a pasted image) changed since the last fit.
+        // Not mid-drag: see `auto_fit_may_run` (Step 13 review).
+        let pointer_busy = ui.input(|input| input.pointer.any_down());
+        let auto_fit = crate::viewport::auto_fit_may_run(tab.auto_fit, pointer_busy);
+        if tab.viewport.refit_if_needed(auto_fit, content, available) {
+            // Info, not debug: the zoom changing on its own is exactly the
+            // thing a bug report is about, and release builds log at info
+            // (SPEC section 0 rule 11).
+            tracing::info!(
+                target: "snp_ligase::ui",
+                zoom = tab.viewport.zoom,
+                canvas = %format!("{:.0} × {:.0}", available.x, available.y),
+                content = %format!("{:.0},{:.0} {:.0} × {:.0}", content.x, content.y, content.w, content.h),
+                "auto-fit re-fitted the view"
+            );
+        }
         // A resize must not leave the content somewhere unreachable.
         tab.viewport.clamp_origin(content, available);
     }
@@ -228,7 +264,7 @@ pub fn show(
     let zoom = tab.viewport.zoom;
     draw_base(&ctx, &painter, tab, max_texture_side, zoom);
     if tab.display_error.is_none() {
-        draw_sprites(&ctx, &painter, tab, fonts, zoom, moving);
+        draw_sprites(&ctx, &painter, tab, fonts, zoom, moving, flatten.expand);
     } else if let Some(message) = tab.display_error.clone() {
         draw_message(&painter, response.rect, &message);
     }
@@ -244,6 +280,7 @@ pub fn show(
     }
 
     draw_preview(&painter, tab, drawing_from, input.image_pointer);
+    draw_freehand_preview(&painter, tab, freehand, input.image_pointer);
     draw_shape_preview(&painter, tab, polygon, input.image_pointer);
     draw_crop_overlay(&painter, tab, crop);
     draw_corner_hint(&painter, response.rect, tab, tool);
@@ -263,6 +300,22 @@ pub fn show(
     }
 
     input
+}
+
+/// Every pointer move in one frame, as image pixels (NEXT_STEPS step 14b).
+///
+/// egui reports a fast drag as several `Event::PointerMoved` in the same frame;
+/// the tools that draw a stroke need all of them. Anything that is not a move
+/// (keys, scroll, button events) is ignored.
+#[must_use]
+pub fn samples_from_events(events: &[egui::Event], viewport: &Viewport) -> Vec<Point> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::PointerMoved(pos) => Some(viewport.to_image(*pos)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The point handle under the pointer, for the right-click menu (SPEC 7.3).
@@ -399,7 +452,9 @@ fn draw_base(
 /// Every annotation's sprite, in the compositing order of SPEC 4.2.
 ///
 /// That order is [`render::compositing_order`], the same one `flatten` uses, so
-/// the two cannot drift.
+/// the two cannot drift. `expand` is the "annotations outside the image" mode,
+/// which decides how far the layers a Blur or Highlight reads reach (NEXT_STEPS
+/// step 12): the screen must grow them exactly like the export does.
 fn draw_sprites(
     ctx: &egui::Context,
     painter: &Painter,
@@ -407,6 +462,7 @@ fn draw_sprites(
     fonts: &mut Fonts,
     zoom: f32,
     moving: bool,
+    expand: bool,
 ) {
     let order = render::compositing_order(&tab.document);
 
@@ -414,7 +470,7 @@ fn draw_sprites(
     // is lent to the texture cache.
     let viewport = tab.viewport;
     for id in order {
-        let Some(sprite) = tab.sprite_texture(ctx, id, fonts, zoom, moving) else {
+        let Some(sprite) = tab.sprite_texture(ctx, id, fonts, zoom, moving, expand) else {
             continue;
         };
 
@@ -483,6 +539,36 @@ fn draw_preview(painter: &Painter, tab: &Tab, from: Option<Point>, current: Opti
     ];
     painter.line_segment(line, stroke);
     painter.circle_stroke(line[0], ADD_HANDLE_RADIUS, stroke);
+}
+
+/// The Freehand stroke being drawn: the samples so far, plus a line to the
+/// pointer (NEXT_STEPS step 14b).
+fn draw_freehand_preview(
+    painter: &Painter,
+    tab: &Tab,
+    points: Option<&[Point]>,
+    current: Option<Point>,
+) {
+    let Some(points) = points else {
+        return;
+    };
+    let mut screen: Vec<Pos2> = points
+        .iter()
+        .map(|point| tab.viewport.to_screen(*point))
+        .collect();
+    if let Some(current) = current {
+        let current = tab.viewport.to_screen(current);
+        if screen.last() != Some(&current) {
+            screen.push(current);
+        }
+    }
+    if screen.len() < 2 {
+        return;
+    }
+    painter.add(egui::Shape::line(
+        screen,
+        Stroke::new(1.0, Color32::from_gray(210)),
+    ));
 }
 
 /// The Shape tool's preview: the edges so far, a preview edge to the cursor,
@@ -593,6 +679,46 @@ fn draw_message(painter: &Painter, area: Rect, message: &str) {
 mod tests {
     use super::*;
     use snp_ligase_core::model::{Document, PathA, Stroke};
+
+    /// NEXT_STEPS step 14b: a fast drag arrives as several `Event::PointerMoved`
+    /// in one frame, and every one of them has to become a sample, mapped
+    /// through the viewport. Non-move events are ignored.
+    #[test]
+    fn every_pointer_move_event_in_a_frame_becomes_a_sample_in_image_pixels() {
+        let mut tab = Tab::new(
+            Document::new(image::RgbaImage::new(200, 200)),
+            "test".to_owned(),
+        );
+        tab.viewport.canvas_min = Vec2::new(30.0, 20.0);
+        tab.viewport.origin = Vec2::new(10.0, 5.0);
+        tab.viewport.zoom = 2.0;
+
+        let events = vec![
+            egui::Event::PointerMoved(pos2(40.0, 30.0)),
+            egui::Event::PointerGone,
+            egui::Event::PointerMoved(pos2(60.0, 50.0)),
+            egui::Event::PointerButton {
+                pos: pos2(60.0, 50.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerMoved(pos2(80.0, 70.0)),
+        ];
+        let samples = samples_from_events(&events, &tab.viewport);
+
+        // (40 - 30 - 10) / 2 = 0, and so on: the canvas start and the pan
+        // come off, and the zoom divides.
+        assert_eq!(
+            samples,
+            vec![
+                Point::new(0.0, 2.5),
+                Point::new(10.0, 12.5),
+                Point::new(20.0, 22.5)
+            ],
+            "a move event was dropped or mis-mapped"
+        );
+    }
 
     /// A two-point straight path, selected, in a tab at 100% with no pan, so
     /// image coordinates and screen points are the same numbers.

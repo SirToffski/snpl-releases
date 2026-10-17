@@ -383,6 +383,14 @@ fn editor(ui: &mut Ui, draft: &mut Settings) {
     );
     ui.checkbox(&mut draft.show_tool_labels, "Show tool labels");
     ui.checkbox(
+        &mut draft.auto_fit_to_window,
+        "Auto-fit images to the window",
+    )
+    .on_hover_text(
+        "New images fit the window and re-fit when it is resized. A manual zoom turns it off \
+         for that image; View > Auto-fit to Window turns it back on.",
+    );
+    ui.checkbox(
         &mut draft.close_hides_to_tray,
         "The close button hides to the tray",
     );

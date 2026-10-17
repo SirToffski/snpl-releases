@@ -94,6 +94,9 @@ pub enum Action {
     ZoomOut,
     ActualSize,
     FitToWindow,
+    /// View > Auto-fit to Window (NEXT_STEPS step 13): the active tab's
+    /// auto-fit state. On fits it immediately; off leaves the zoom alone.
+    AutoFit(bool),
     ShowToolLabels(bool),
     ShowProperties(bool),
     KeyboardShortcuts,
@@ -296,6 +299,9 @@ pub struct MenuState {
     pub tool: Tool,
     pub show_properties: bool,
     pub show_tool_labels: bool,
+    /// The active tab's auto-fit state, for the View menu's check mark
+    /// (NEXT_STEPS step 13). False with no tab open.
+    pub auto_fit: bool,
     /// True once the font system has loaded (SPEC 7.5): the Text tool is
     /// disabled with a "Loading fonts…" label until then.
     pub fonts_ready: bool,
@@ -1054,6 +1060,15 @@ fn view(ui: &mut Ui, state: &MenuState, actions: &mut Vec<Action>) {
         state.has_tab,
         actions,
     );
+    ui.add_enabled_ui(state.has_tab, |ui| {
+        check(
+            ui,
+            "Auto-fit to Window",
+            state.auto_fit,
+            Action::AutoFit(!state.auto_fit),
+            actions,
+        );
+    });
     ui.separator();
     check(
         ui,
@@ -1290,6 +1305,11 @@ pub fn status_bar(
                     };
                     ui.separator();
                     ui.label(format!("Zoom {:.0}%", tab.viewport.zoom * 100.0));
+                    // NEXT_STEPS step 13: the user can see why the zoom
+                    // changes by itself.
+                    if tab.auto_fit {
+                        ui.label("Auto-fit");
+                    }
                     ui.separator();
                     match cursor {
                         Some(point) => {
@@ -1442,6 +1462,48 @@ mod tests {
         );
     }
 
+    /// NEXT_STEPS step 13: the status bar says "Auto-fit" next to the zoom
+    /// while auto-fit is on, so the user can see why the zoom changes by
+    /// itself (SPEC 8.2's status bar).
+    #[test]
+    fn the_status_bar_shows_auto_fit_beside_the_zoom() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let tab = Tab::new(
+            snp_ligase_core::model::Document::new(image::RgbaImage::new(100, 100)),
+            "test".to_owned(),
+        );
+        assert!(tab.auto_fit, "a new tab starts with auto-fit on");
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, ()| {
+                status_bar(ui, Some(&tab), None, "", None);
+            },
+            (),
+        );
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("Auto-fit").is_some(),
+            "the status bar does not say auto-fit is on"
+        );
+
+        let mut tab = Tab::new(
+            snp_ligase_core::model::Document::new(image::RgbaImage::new(100, 100)),
+            "test".to_owned(),
+        );
+        tab.auto_fit = false;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, ()| {
+                status_bar(ui, Some(&tab), None, "", None);
+            },
+            (),
+        );
+        harness.run();
+        assert!(
+            harness.query_by_label_contains("Auto-fit").is_none(),
+            "the status bar claims auto-fit is on after a manual zoom"
+        );
+    }
+
     /// NEXT_STEPS step 11: the File menu's "Paste Image into This Tab" row is a
     /// real action (SPEC 8.1 rule 2), and it is disabled with no tab open.
     #[test]
@@ -1491,6 +1553,52 @@ mod tests {
         );
     }
 
+    /// NEXT_STEPS step 13: the View menu carries a checkable "Auto-fit to
+    /// Window" row that shows the active tab's state and offers to flip it
+    /// (SPEC 8.1 rule 2: every option is reachable from the menu bar).
+    #[test]
+    fn the_view_menu_has_an_auto_fit_row() {
+        use egui_kittest::kittest::Queryable as _;
+
+        let menu_state = state(Vec::new(), false);
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, actions: &mut Vec<Action>| {
+                menu_bar(ui, &menu_state, actions);
+            },
+            Vec::<Action>::new(),
+        );
+        harness.run();
+        harness.get_by_label("View").click();
+        harness.run();
+        harness.get_by_label_contains("Auto-fit to Window").click();
+        harness.run();
+        assert!(
+            harness.state().contains(&Action::AutoFit(false)),
+            "the checked row did not offer to turn auto-fit off: {:?}",
+            harness.state()
+        );
+
+        // With auto-fit already off the row offers to turn it back on.
+        let mut menu_state = state(Vec::new(), false);
+        menu_state.auto_fit = false;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, actions: &mut Vec<Action>| {
+                menu_bar(ui, &menu_state, actions);
+            },
+            Vec::<Action>::new(),
+        );
+        harness.run();
+        harness.get_by_label("View").click();
+        harness.run();
+        harness.get_by_label_contains("Auto-fit to Window").click();
+        harness.run();
+        assert!(
+            harness.state().contains(&Action::AutoFit(true)),
+            "the unchecked row did not offer to turn auto-fit on: {:?}",
+            harness.state()
+        );
+    }
+
     fn state(nodes: Vec<StyleNode>, has_selection: bool) -> MenuState {
         MenuState {
             can_undo: false,
@@ -1500,6 +1608,7 @@ mod tests {
             tool: Tool::Select,
             show_properties: true,
             show_tool_labels: true,
+            auto_fit: true,
             fonts_ready: true,
             delay_seconds: 0,
             active_tab: 0,

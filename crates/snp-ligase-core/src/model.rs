@@ -188,6 +188,19 @@ mod image_png {
     }
 }
 
+/// A freehand stroke: the pointer samples of one drag, already simplified
+/// (NEXT_STEPS step 14a).
+///
+/// The human asked for it against SPEC section 1's non-goal list; the change
+/// of scope is recorded in `DECISIONS.md`. There are no handles: like Text and
+/// a pasted image, a stroke only moves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FreehandA {
+    /// Two or more points in image pixels, in the order they were drawn.
+    pub points: Vec<Point>,
+    pub stroke: Stroke,
+}
+
 /// What an annotation actually is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -201,6 +214,8 @@ pub enum Kind {
     Blur(BlurA),
     /// A pasted image (NEXT_STEPS step 11).
     Image(ImageA),
+    /// A freehand stroke (NEXT_STEPS step 14a).
+    Freehand(FreehandA),
 }
 
 impl Kind {
@@ -217,6 +232,7 @@ impl Kind {
             Self::Highlight(_) => "Highlight",
             Self::Blur(_) => "Blur",
             Self::Image(_) => "Pasted image",
+            Self::Freehand(_) => "Freehand",
         }
     }
 
@@ -460,6 +476,12 @@ mod tests {
             image: Arc::new(RgbaImage::new(1, 1)),
         });
         assert_eq!(image.name(), "Pasted image");
+
+        let freehand = Kind::Freehand(FreehandA {
+            points: vec![Point::new(0.0, 0.0), Point::new(10.0, 10.0)],
+            stroke: defaults::stroke(),
+        });
+        assert_eq!(freehand.name(), "Freehand");
     }
 
     #[test]
@@ -484,6 +506,15 @@ mod tests {
             !Kind::Image(ImageA {
                 pos: Point::new(0.0, 0.0),
                 image: Arc::new(RgbaImage::new(1, 1)),
+            })
+            .is_effect()
+        );
+        // A freehand stroke is a plain annotation: its pixels are its own and
+        // it draws above the effects (NEXT_STEPS step 14a).
+        assert!(
+            !Kind::Freehand(FreehandA {
+                points: vec![Point::new(0.0, 0.0), Point::new(4.0, 4.0)],
+                stroke: defaults::stroke(),
             })
             .is_effect()
         );
@@ -559,6 +590,19 @@ mod tests {
             Kind::Image(ImageA {
                 pos: Point::new(3.0, 4.0),
                 image: Arc::new(RgbaImage::from_pixel(2, 3, image::Rgba([9, 8, 7, 255]))),
+            }),
+            // NEXT_STEPS step 14a: a freehand stroke round-trips like every
+            // other kind.
+            Kind::Freehand(FreehandA {
+                points: vec![
+                    Point::new(1.0, 2.0),
+                    Point::new(3.5, 4.25),
+                    Point::new(8.0, 1.5),
+                ],
+                stroke: Stroke {
+                    color: [3, 2, 1, 128],
+                    width: 6.5,
+                },
             }),
         ];
 

@@ -12,6 +12,7 @@
 //! slack, so they can never disagree about how big a sprite is.
 
 pub mod effect;
+pub mod freehand;
 pub mod image;
 pub mod number;
 pub mod path;
@@ -98,22 +99,158 @@ pub fn painted_bounds(sprite: &Sprite) -> Option<RectI> {
     })
 }
 
+/// A rasterized layer of the document, plus where its top-left pixel sits in
+/// image coordinates (NEXT_STEPS step 12).
+///
+/// Blur and Highlight draw pixels that come from a layer instead of from
+/// vector drawing, so they need to know both the pixels and how the layer sits
+/// in image coordinates: with "annotations outside the image" set to Expand the
+/// layer covers the base image **and** the pasted images beside it, and it does
+/// not have to start at (0, 0).
+#[derive(Clone)]
+pub struct Layer {
+    pixels: Arc<RgbaImage>,
+    origin: (i32, i32),
+    /// The image rectangles that really have pixels: the base image and the
+    /// painted pixels of every pasted image. `None` means the whole rectangle,
+    /// which is what a base-sized layer has; with images the layer's bounding
+    /// rectangle can hold gaps (the space between the base and a pasted image)
+    /// and an effect that drew there would paint the fill colour of the added
+    /// area (J1).
+    covered: Option<Vec<RectI>>,
+}
+
+impl Layer {
+    /// A layer that covers exactly one image, at (0, 0): the base image on its
+    /// own, which is what an effect reads in Cut mode.
+    #[must_use]
+    pub fn whole(pixels: Arc<RgbaImage>) -> Self {
+        Self {
+            pixels,
+            origin: (0, 0),
+            covered: None,
+        }
+    }
+
+    fn new(pixels: RgbaImage, origin: (i32, i32), covered: Option<Vec<RectI>>) -> Self {
+        Self {
+            pixels: Arc::new(pixels),
+            origin,
+            covered,
+        }
+    }
+
+    /// The layer's pixels.
+    #[must_use]
+    pub fn pixels(&self) -> &RgbaImage {
+        &self.pixels
+    }
+
+    /// Where the layer's top-left pixel is in image coordinates.
+    #[must_use]
+    pub fn origin(&self) -> (i32, i32) {
+        self.origin
+    }
+
+    /// The layer's rectangle in image coordinates.
+    #[must_use]
+    pub fn rect(&self) -> RectI {
+        RectI {
+            x: self.origin.0,
+            y: self.origin.1,
+            right: self.origin.0 + self.pixels.width() as i32,
+            bottom: self.origin.1 + self.pixels.height() as i32,
+        }
+    }
+
+    /// True when both layers are the same buffer at the same place. The sprite
+    /// cache uses this for its staleness test: two equal images still rasterize
+    /// the same, but only the same buffer can be assumed to.
+    #[must_use]
+    pub fn shares_pixels(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.pixels, &other.pixels) && self.origin == other.origin
+    }
+
+    /// True when the layer is exactly this buffer at (0, 0): the comparison the
+    /// sprite cache uses for sprites that are not effects.
+    #[must_use]
+    pub fn is_buffer(&self, pixels: &Arc<RgbaImage>) -> bool {
+        self.origin == (0, 0) && Arc::ptr_eq(&self.pixels, pixels)
+    }
+
+    fn source(&self) -> Source<'_> {
+        Source {
+            pixels: &self.pixels,
+            origin: self.origin,
+            covered: self.covered.as_deref(),
+        }
+    }
+}
+
+/// What an effect reads: the layer's pixels, where they sit, and which image
+/// rectangles really have pixels.
+struct Source<'a> {
+    pixels: &'a RgbaImage,
+    origin: (i32, i32),
+    covered: Option<&'a [RectI]>,
+}
+
+/// True when `outer` covers every pixel of `inner`.
+fn rect_contains(outer: RectI, inner: RectI) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.right <= outer.right
+        && inner.bottom <= outer.bottom
+}
+
+/// True when the image pixel is inside `rect`.
+fn rect_has_pixel(rect: RectI, x: i32, y: i32) -> bool {
+    x >= rect.x && x < rect.right && y >= rect.y && y < rect.bottom
+}
+
 /// Rasterizes one annotation, shadow included.
 ///
 /// `None` means there is nothing to draw: an annotation with no stroke and no
 /// fill, or an empty path.
+///
+/// An effect reads `base` at its own (0, 0); [`rasterize_layer`] is the variant
+/// for a layer with an origin (NEXT_STEPS step 12).
 pub fn rasterize(a: &Annotation, base: &RgbaImage, fonts: &mut Fonts) -> Option<Sprite> {
+    rasterize_source(
+        a,
+        &Source {
+            pixels: base,
+            origin: (0, 0),
+            covered: None,
+        },
+        fonts,
+    )
+}
+
+/// [`rasterize`] for an effect that reads a [`Layer`]: the annotation's
+/// rectangle is mapped onto the layer's coordinates, and the result is placed
+/// back in image coordinates.
+pub fn rasterize_layer(a: &Annotation, layer: &Layer, fonts: &mut Fonts) -> Option<Sprite> {
+    rasterize_source(a, &layer.source(), fonts)
+}
+
+fn rasterize_source(a: &Annotation, source: &Source<'_>, fonts: &mut Fonts) -> Option<Sprite> {
+    let origin = source.origin;
     // Effects do not use the shape canvas at all: their pixels come from the
-    // base image, and their rectangle is exactly the rectangle they were given.
+    // layer, and their rectangle is exactly the rectangle they were given.
     match &a.kind {
         Kind::Highlight(highlight) => {
+            let local = highlight
+                .rect
+                .translated(-(origin.0 as f32), -(origin.1 as f32));
             let (image, covered) =
-                crate::effects::highlight_rect(base, highlight.rect, highlight.color);
-            return sprite_from_image(image, covered);
+                crate::effects::highlight_rect(source.pixels, local, highlight.color);
+            return effect_sprite(image, covered.translated(origin.0, origin.1), source);
         }
         Kind::Blur(blur) => {
-            let (image, covered) = crate::effects::blur_rect(base, blur.rect, blur.radius);
-            return sprite_from_image(image, covered);
+            let local = blur.rect.translated(-(origin.0 as f32), -(origin.1 as f32));
+            let (image, covered) = crate::effects::blur_rect(source.pixels, local, blur.radius);
+            return effect_sprite(image, covered.translated(origin.0, origin.1), source);
         }
         _ => {}
     }
@@ -199,31 +336,73 @@ pub fn compositing_order(doc: &Document) -> Vec<u64> {
 }
 
 /// The base every pasted image draws on: `doc.base` with every Image
-/// annotation composited, in list order (NEXT_STEPS step 11).
+/// annotation composited, in list order (NEXT_STEPS step 11), as a [`Layer`]
+/// (step 12).
 ///
 /// This is the layer Blur sprites read, so a blur over a pasted image really
 /// blurs the pasted pixels rather than the base image behind them.
+///
+/// With `expand` the layer covers the base image **and** the painted pixels of
+/// the pasted images, so a blur or highlight outside the original screenshot
+/// has pixels to read. Without it the layer is exactly the base image, which
+/// keeps Cut mode byte-for-byte what it always was.
 #[must_use]
-pub fn images_base(doc: &Document, fonts: &mut Fonts) -> Arc<RgbaImage> {
-    let any_images = doc
-        .annotations
-        .iter()
-        .any(|a| matches!(a.kind, Kind::Image(_)));
-    if !any_images {
-        return Arc::clone(&doc.base);
-    }
-
-    let mut base = doc.base.as_ref().clone();
+pub fn images_base(doc: &Document, fonts: &mut Fonts, expand: bool) -> Layer {
+    let mut sprites = Vec::new();
     for annotation in doc
         .annotations
         .iter()
         .filter(|a| matches!(a.kind, Kind::Image(_)))
     {
         if let Some(sprite) = rasterize(annotation, &doc.base, fonts) {
-            composite_onto(&mut base, &sprite);
+            sprites.push(sprite);
         }
     }
-    Arc::new(base)
+    if sprites.is_empty() {
+        return Layer::whole(Arc::clone(&doc.base));
+    }
+
+    let base_rect = RectI {
+        x: 0,
+        y: 0,
+        right: doc.base.width() as i32,
+        bottom: doc.base.height() as i32,
+    };
+    let mut area = base_rect;
+    let mut covered = vec![base_rect];
+    for sprite in &sprites {
+        if let Some(painted) = painted_bounds(sprite) {
+            area = area.union(painted);
+            covered.push(painted);
+        }
+    }
+
+    if !expand || area == base_rect || too_large(area) {
+        // Cut mode, or a layer the export would refuse to build anyway: the
+        // base-sized layer, exactly as before step 12.
+        let mut pixels = doc.base.as_ref().clone();
+        for sprite in &sprites {
+            composite_onto(&mut pixels, sprite, (0, 0));
+        }
+        return Layer::new(pixels, (0, 0), None);
+    }
+
+    let offset = (-area.x, -area.y);
+    let mut pixels = RgbaImage::new(area.width(), area.height());
+    paste_region(&mut pixels, &doc.base, offset);
+    // `composite_onto` takes the layer's *origin* (where image (0, 0) sits is
+    // its negation): passing `offset` here put a pasted image left of or above
+    // the base in the wrong place, and a Blur over it read empty pixels.
+    for sprite in &sprites {
+        composite_onto(&mut pixels, sprite, (area.x, area.y));
+    }
+    Layer::new(pixels, (area.x, area.y), Some(covered))
+}
+
+/// True when a rectangle is past the size [`flatten_with`] will build.
+fn too_large(area: RectI) -> bool {
+    let (width, height) = (area.width(), area.height());
+    width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_EXPORT_PIXELS
 }
 
 /// [`images_base`] with every Blur already composited; Highlights read this,
@@ -232,43 +411,39 @@ pub fn images_base(doc: &Document, fonts: &mut Fonts) -> Arc<RgbaImage> {
 ///
 /// The canvas calls this too, so the screen and the saved file agree.
 #[must_use]
-pub fn effects_base(doc: &Document, fonts: &mut Fonts) -> Arc<RgbaImage> {
-    let images = images_base(doc, fonts);
+pub fn effects_base(doc: &Document, fonts: &mut Fonts, expand: bool) -> Layer {
+    let images = images_base(doc, fonts, expand);
     effects_base_from(doc, &images, fonts)
 }
 
 /// [`effects_base`] for an images layer that is already built.
 ///
 /// The app and `flatten_with` need both layers, and building the images layer
-/// twice would composite a large pasted image twice for nothing.
+/// twice would composite a large pasted image twice for nothing. The result
+/// keeps the images layer's origin and coverage.
 #[must_use]
-pub fn effects_base_from(
-    doc: &Document,
-    images: &Arc<RgbaImage>,
-    fonts: &mut Fonts,
-) -> Arc<RgbaImage> {
+pub fn effects_base_from(doc: &Document, images: &Layer, fonts: &mut Fonts) -> Layer {
     let any_blurs = doc
         .annotations
         .iter()
         .any(|a| matches!(a.kind, Kind::Blur(_)));
     if !any_blurs {
-        return Arc::clone(images);
+        return images.clone();
     }
 
     // Every Blur reads the base with the images but *without* the other blurs,
     // so two overlapping blurs each blur the same sharp pixels.
-    let source = images.as_ref();
-    let mut base = source.clone();
+    let mut pixels = images.pixels().clone();
     for annotation in doc
         .annotations
         .iter()
         .filter(|a| matches!(a.kind, Kind::Blur(_)))
     {
-        if let Some(sprite) = rasterize(annotation, source, fonts) {
-            composite_onto(&mut base, &sprite);
+        if let Some(sprite) = rasterize_layer(annotation, images, fonts) {
+            composite_onto(&mut pixels, &sprite, images.origin());
         }
     }
-    Arc::new(base)
+    Layer::new(pixels, images.origin(), images.covered.clone())
 }
 
 /// Rasterizes every annotation onto the base image (SPEC section 4.1).
@@ -282,8 +457,8 @@ pub fn effects_base_from(
 #[must_use]
 pub fn flatten(doc: &Document, fonts: &mut Fonts) -> RgbaImage {
     // The base plus the pasted images plus the blurs; Highlights read this.
-    let base = effects_base(doc, fonts);
-    let mut canvas = base.as_ref().clone();
+    let base = effects_base(doc, fonts, false);
+    let mut canvas = base.pixels().clone();
 
     // A highlight over a blur multiplies the blurred pixels rather than the
     // sharp ones.
@@ -292,8 +467,8 @@ pub fn flatten(doc: &Document, fonts: &mut Fonts) -> RgbaImage {
         .iter()
         .filter(|a| matches!(a.kind, Kind::Highlight(_)))
     {
-        if let Some(sprite) = rasterize(annotation, &base, fonts) {
-            composite_onto(&mut canvas, &sprite);
+        if let Some(sprite) = rasterize_layer(annotation, &base, fonts) {
+            composite_onto(&mut canvas, &sprite, base.origin());
         }
     }
 
@@ -305,7 +480,7 @@ pub fn flatten(doc: &Document, fonts: &mut Fonts) -> RgbaImage {
         .filter(|a| !a.kind.is_effect() && !matches!(a.kind, Kind::Image(_)))
     {
         if let Some(sprite) = rasterize(annotation, &doc.base, fonts) {
-            composite_onto(&mut canvas, &sprite);
+            composite_onto(&mut canvas, &sprite, base.origin());
         }
     }
 
@@ -342,10 +517,12 @@ impl FlattenOptions {
 /// the **painted pixels** of every annotation that draws (NEXT_STEPS step 11,
 /// J1 and J2).
 ///
-/// Blur and Highlight are left out. Their pixels come from the base image and
-/// are clipped to it, so they can never draw outside it; unioning in the
-/// rectangle they were given made a blur dragged past the top edge grow the
-/// saved image by a strip of fill colour (J1).
+/// Blur and Highlight are left out. Their pixels come from the layer with the
+/// pasted images, which never reaches past the pasted pixels themselves
+/// (NEXT_STEPS step 12), so they can never draw anywhere the pasted images do
+/// not already reach; unioning in the rectangle they were given made a blur
+/// dragged past the top edge grow the saved image by a strip of fill colour
+/// (J1).
 ///
 /// Everything else contributes its painted pixels rather than its
 /// [`bounds`]: the two pixels of anti-aliasing slack are not something the
@@ -391,9 +568,9 @@ fn export_bounds_from_sprites<'a>(
 ///
 /// The compositing order is the same as [`flatten`]'s, so the two modes and the
 /// canvas agree about what is on top. Blur and Highlight sprites are clipped to
-/// the base image, because that is all there is to blur or tint: they can never
-/// grow the export, and the part of such an annotation that sticks out of the
-/// image draws nothing (J1).
+/// the [`Layer`] they read — the base image and the pasted images (NEXT_STEPS
+/// step 12) — so they can never grow the export, and the part of such an
+/// annotation that sticks out of that layer draws nothing (J1).
 ///
 /// Every annotation is rasterized once, up front: the painted pixels of the
 /// non-effect sprites decide how big the export is (J2), and the same sprites
@@ -404,9 +581,11 @@ pub fn flatten_with(doc: &Document, fonts: &mut Fonts, options: &FlattenOptions)
         return flatten(doc, fonts);
     }
 
-    // The two layers Blur and Highlight read (NEXT_STEPS step 11): the base
-    // plus the pasted images, and that plus the blurs.
-    let images = images_base(doc, fonts);
+    // The two layers Blur and Highlight read (NEXT_STEPS steps 11 and 12): the
+    // base plus the pasted images, and that plus the blurs. With Expand the
+    // layers reach the pasted images, so an effect outside the original
+    // screenshot has pixels to read.
+    let images = images_base(doc, fonts, true);
     let effects = effects_base_from(doc, &images, fonts);
 
     let mut image_sprites: Vec<Sprite> = Vec::new();
@@ -416,8 +595,8 @@ pub fn flatten_with(doc: &Document, fonts: &mut Fonts, options: &FlattenOptions)
     for annotation in &doc.annotations {
         let sprite = match &annotation.kind {
             Kind::Image(_) => rasterize(annotation, &doc.base, fonts),
-            Kind::Blur(_) => rasterize(annotation, &images, fonts),
-            Kind::Highlight(_) => rasterize(annotation, &effects, fonts),
+            Kind::Blur(_) => rasterize_layer(annotation, &images, fonts),
+            Kind::Highlight(_) => rasterize_layer(annotation, &effects, fonts),
             _ => rasterize(annotation, &doc.base, fonts),
         };
         let Some(sprite) = sprite else {
@@ -432,8 +611,9 @@ pub fn flatten_with(doc: &Document, fonts: &mut Fonts, options: &FlattenOptions)
     }
 
     // J1 + J2: the base united with the painted pixels of every sprite that is
-    // not an effect. Blur and Highlight are clipped to the base image, so they
-    // cannot grow it; the pasted images are part of the export.
+    // not an effect. Blur and Highlight are clipped to the layer with the
+    // pasted images, so they cannot grow it past what the pasted images
+    // painted; the pasted images are part of the export.
     let export = export_bounds_from_sprites(
         doc.base.width(),
         doc.base.height(),
@@ -588,6 +768,7 @@ fn shape(a: &Annotation, fonts: &mut Fonts) -> Option<(Pixmap, (i32, i32))> {
         Kind::Text(t) => text::draw(&mut canvas, t, fonts),
         Kind::Number(n) => number::draw(&mut canvas, n, fonts),
         Kind::Image(pasted) => image::draw(&mut canvas, pasted),
+        Kind::Freehand(stroke) => freehand::draw(&mut canvas, stroke),
         // Effects never reach here: they are rasterized from the base image.
         Kind::Highlight(_) | Kind::Blur(_) => return None,
     }
@@ -611,6 +792,7 @@ pub fn shape_bounds(a: &Annotation, fonts: &mut Fonts) -> Rect {
         Kind::Text(text) => text::shape_bounds(text, fonts),
         Kind::Number(number) => number::shape_bounds(number),
         Kind::Image(pasted) => image::shape_bounds(pasted),
+        Kind::Freehand(stroke) => freehand::shape_bounds(stroke),
     }
 }
 
@@ -702,13 +884,17 @@ fn source_over(dst: &mut [u8], src: &[u8]) {
 
 /// Composites a sprite onto an image, which is how `flatten` builds its result.
 ///
+/// `offset` is where the image's own (0, 0) sits inside the sprite's
+/// coordinate space: (0, 0) for the base image, the layer's origin when the
+/// image is a [`Layer`] that reaches past the base (NEXT_STEPS step 12).
+///
 /// The sprite is premultiplied and the image is straight, so the blend is the
 /// premultiplied source-over: `out = src + dst * (1 - src_alpha)`. That is
 /// [`over_pixel`]'s formula; the image is opaque in the normal case, where the
 /// two agree exactly, and this is the M2 behaviour the goldens pin down.
-fn composite_onto(image: &mut RgbaImage, sprite: &Sprite) {
+fn composite_onto(image: &mut RgbaImage, sprite: &Sprite, offset: (i32, i32)) {
     let (width, height) = (sprite.pixmap.width(), sprite.pixmap.height());
-    let (origin_x, origin_y) = sprite.origin;
+    let (origin_x, origin_y) = (sprite.origin.0 - offset.0, sprite.origin.1 - offset.1);
     let data = sprite.pixmap.data();
 
     for row in 0..height as i32 {
@@ -727,6 +913,60 @@ fn composite_onto(image: &mut RgbaImage, sprite: &Sprite) {
             over_pixel(&mut image.as_mut()[at..at + 4], source);
         }
     }
+}
+
+/// Copies an image into a bigger canvas at `origin`, clipped to the canvas.
+///
+/// The bytes are copied, not blended: this is the first thing drawn on a layer
+/// (the base image), so there is nothing under it. Like [`composite_onto`], the
+/// straight-alpha bytes are treated as premultiplied while the layer is built.
+fn paste_region(canvas: &mut RgbaImage, source: &RgbaImage, origin: (i32, i32)) {
+    let rows = source.height() as i32;
+    let columns = source.width() as i32;
+    for row in 0..rows {
+        let y = origin.1 + row;
+        if y < 0 || y >= canvas.height() as i32 {
+            continue;
+        }
+        let first = 0.max(-origin.0);
+        let last = columns.min(canvas.width() as i32 - origin.0);
+        if first >= last {
+            continue;
+        }
+        let from = (row as usize * columns as usize + first as usize) * 4;
+        let to = (y as usize * canvas.width() as usize + (origin.0 + first) as usize) * 4;
+        let length = (last - first) as usize * 4;
+        canvas.as_mut()[to..to + length].copy_from_slice(&source.as_raw()[from..from + length]);
+    }
+}
+
+/// Wraps an effect's pixels as a sprite, dropping the parts of the layer's
+/// bounding rectangle that have no pixels under them (NEXT_STEPS step 12).
+///
+/// The layer can be bigger than what it is made of: with the base image and a
+/// pasted one beside it, the space between them is inside the layer's
+/// rectangle but there is nothing there. A Blur or Highlight that drew the
+/// filled pixels it computed for such a gap would paint over the fill colour of
+/// the added area, so those pixels are dropped (J1).
+fn effect_sprite(mut image: RgbaImage, covered: RectI, source: &Source<'_>) -> Option<Sprite> {
+    let Some(rects) = source.covered else {
+        return sprite_from_image(image, covered);
+    };
+    if rects.iter().any(|rect| rect_contains(*rect, covered)) {
+        return sprite_from_image(image, covered);
+    }
+
+    let mut painted = false;
+    for (column, row, pixel) in image.enumerate_pixels_mut() {
+        let (x, y) = (covered.x + column as i32, covered.y + row as i32);
+        if rects.iter().any(|rect| rect_has_pixel(*rect, x, y)) {
+            painted = true;
+        } else {
+            // Zeroed in place: transparent premultiplied pixels have no colour.
+            pixel.0 = [0, 0, 0, 0];
+        }
+    }
+    painted.then(|| sprite_from_image(image, covered))?
 }
 
 /// Wraps an opaque image region as a sprite positioned at `covered`'s origin.

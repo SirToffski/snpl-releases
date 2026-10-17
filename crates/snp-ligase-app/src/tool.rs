@@ -16,12 +16,15 @@ pub enum Tool {
     Number,
     Highlight,
     Blur,
+    /// Freehand pen: press, drag, release draws one stroke (NEXT_STEPS step
+    /// 14b, a human-approved addition to SPEC section 1's non-goal list).
+    Freehand,
     Crop,
 }
 
 impl Tool {
     /// Every tool, in the Tools menu's order (SPEC 8.3).
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Select,
         Self::Line,
         Self::Arrow,
@@ -31,6 +34,7 @@ impl Tool {
         Self::Number,
         Self::Highlight,
         Self::Blur,
+        Self::Freehand,
         Self::Crop,
     ];
 
@@ -48,6 +52,7 @@ impl Tool {
             Self::Number => "Number",
             Self::Highlight => "Highlight",
             Self::Blur => "Blur",
+            Self::Freehand => "Freehand",
             Self::Crop => "Crop",
         }
     }
@@ -65,6 +70,7 @@ impl Tool {
             Self::Number => "N",
             Self::Highlight => "H",
             Self::Blur => "B",
+            Self::Freehand => "F",
             Self::Crop => "C",
         }
     }
@@ -75,7 +81,7 @@ impl Tool {
 /// `built` is false for the tools this milestone has not finished yet, so the
 /// menu already shows the whole list and those rows say why they cannot be
 /// picked rather than doing nothing.
-pub const TOOL_MENU: [(&str, &str, bool); 10] = [
+pub const TOOL_MENU: [(&str, &str, bool); 11] = [
     ("Select", "V", true),
     ("Line", "L", true),
     ("Arrow", "A", true),
@@ -85,6 +91,7 @@ pub const TOOL_MENU: [(&str, &str, bool); 10] = [
     ("Number", "N", true),
     ("Highlight", "H", true),
     ("Blur", "B", true),
+    ("Freehand", "F", true),
     ("Crop", "C", true),
 ];
 
@@ -117,6 +124,10 @@ pub fn tool_for_kind(kind: &snp_ligase_core::model::Kind) -> Option<Tool> {
         K::Highlight(_) => Some(Tool::Highlight),
         K::Blur(_) => Some(Tool::Blur),
         K::Image(_) => None,
+        // A freehand stroke belongs to the Freehand tool, so a change to its
+        // stroke colour updates that tool's own defaults (NEXT_STEPS step 14b;
+        // 14a added the kind to the core only).
+        K::Freehand(_) => Some(Tool::Freehand),
     }
 }
 
@@ -180,6 +191,9 @@ impl StyleNode {
             // A pasted image takes a shadow and nothing else; resizing is out
             // of scope (NEXT_STEPS step 11).
             Kind::Image(_) => vec![Self::Shadow],
+            // A freehand stroke's style is the stroke and the shadow
+            // (NEXT_STEPS step 14a; the tool arrives in 14b).
+            Kind::Freehand(_) => vec![Self::Stroke, Self::Shadow],
         }
     }
 
@@ -202,6 +216,9 @@ impl StyleNode {
             Tool::Number => vec![Self::NumberFill, Self::NumberSize, Self::Shadow],
             Tool::Highlight => vec![Self::HighlightColour],
             Tool::Blur => vec![Self::BlurStrength],
+            // A freehand stroke's style is the stroke and the shadow
+            // (NEXT_STEPS step 14b).
+            Tool::Freehand => vec![Self::Stroke, Self::Shadow],
             // Select has no style; Crop uses the rectangle it is dragging.
             Tool::Select | Tool::Crop => Vec::new(),
         }
@@ -311,6 +328,9 @@ pub struct ToolStyles {
     number: ToolStyle,
     highlight: ToolStyle,
     blur: ToolStyle,
+    /// Freehand (NEXT_STEPS step 14b): stroke only, so the SPEC 7.7 defaults —
+    /// `#E81123`, 4 px, no shadow — are exactly `ToolStyle::default`.
+    freehand: ToolStyle,
 }
 
 impl ToolStyles {
@@ -326,6 +346,7 @@ impl ToolStyles {
             Tool::Number => Some(&self.number),
             Tool::Highlight => Some(&self.highlight),
             Tool::Blur => Some(&self.blur),
+            Tool::Freehand => Some(&self.freehand),
             Tool::Select | Tool::Crop => None,
         }
     }
@@ -341,6 +362,7 @@ impl ToolStyles {
             Tool::Number => Some(&mut self.number),
             Tool::Highlight => Some(&mut self.highlight),
             Tool::Blur => Some(&mut self.blur),
+            Tool::Freehand => Some(&mut self.freehand),
             Tool::Select | Tool::Crop => None,
         }
     }
@@ -469,8 +491,8 @@ mod tests {
     }
 
     #[test]
-    fn the_tools_menu_lists_all_ten_rows_with_a_key() {
-        assert_eq!(TOOL_MENU.len(), 10);
+    fn the_tools_menu_lists_all_eleven_rows_with_a_key() {
+        assert_eq!(TOOL_MENU.len(), 11);
         assert_eq!(Tool::ALL.len(), TOOL_MENU.len());
         for (index, (name, key, _built)) in TOOL_MENU.iter().enumerate() {
             assert!(!name.is_empty());
@@ -576,6 +598,23 @@ mod tests {
         });
         assert_eq!(tool_for_kind(&image), None);
         assert_eq!(StyleNode::of_kind(&image), vec![StyleNode::Shadow]);
+
+        // NEXT_STEPS step 14b: a freehand stroke now has a tool of its own, so
+        // a stroke colour change updates the Freehand defaults.
+        let freehand = snp_ligase_core::model::Kind::Freehand(snp_ligase_core::model::FreehandA {
+            points: vec![Point::new(0.0, 0.0), Point::new(10.0, 10.0)],
+            stroke: defaults::stroke(),
+        });
+        assert_eq!(tool_for_kind(&freehand), Some(Tool::Freehand));
+        assert_eq!(
+            StyleNode::of_kind(&freehand),
+            vec![StyleNode::Stroke, StyleNode::Shadow]
+        );
+        assert_eq!(
+            StyleNode::of_tool(Tool::Freehand),
+            vec![StyleNode::Stroke, StyleNode::Shadow],
+            "the panel must offer the stroke controls for the Freehand tool"
+        );
     }
 
     #[test]
@@ -623,6 +662,13 @@ mod tests {
 
         let blur = styles.get(Tool::Blur).expect("a blur style");
         assert!((blur.blur_radius - 28.0).abs() < 0.001);
+
+        // NEXT_STEPS step 14b: the Freehand tool's own style starts from SPEC
+        // 7.7's stroke defaults and no shadow.
+        let freehand = styles.get(Tool::Freehand).expect("a freehand style");
+        assert_eq!(freehand.stroke_color, [232, 17, 35, 255], "SPEC 7.7");
+        assert!((freehand.stroke_width - 4.0).abs() < 0.001, "SPEC 7.7");
+        assert!(!freehand.shadow, "SPEC 7.7: shadow off");
     }
 
     #[test]

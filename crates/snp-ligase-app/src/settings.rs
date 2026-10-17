@@ -136,6 +136,10 @@ pub struct Settings {
     pub switch_to_select_after_drawing: bool,
     /// Show each tool's name next to its key (default on).
     pub show_tool_labels: bool,
+    /// Auto-fit a new tab to the window and re-fit it when the window is
+    /// resized (NEXT_STEPS step 13; default on). A manual zoom turns it off
+    /// for that tab, and View > Auto-fit to Window turns it back on.
+    pub auto_fit_to_window: bool,
     /// The window's X hides to the tray (default on).
     pub close_hides_to_tray: bool,
     /// Start with the window hidden in the tray (M7; default off).
@@ -177,6 +181,7 @@ impl Default for Settings {
             ask_before_closing: true,
             switch_to_select_after_drawing: false,
             show_tool_labels: true,
+            auto_fit_to_window: true,
             close_hides_to_tray: true,
             start_hidden_in_tray: false,
             start_with_windows: false,
@@ -895,6 +900,26 @@ mod tests {
                 expand: true,
                 fill: Some([255, 255, 255, 255]),
             }
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// NEXT_STEPS step 13: "auto-fit images to the window" is serde-defaulted,
+    /// so a config file written before it existed still loads, with it on.
+    #[test]
+    fn a_config_without_the_auto_fit_row_still_loads() {
+        let folder = temp_dir("old-auto-fit");
+        std::fs::write(
+            folder.join(CONFIG_FILE),
+            "include_cursor = true\njpeg_quality = 77\n",
+        )
+        .expect("the test file should be writable");
+
+        let (store, warnings) = SettingsStore::load(folder.clone());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            store.settings().auto_fit_to_window,
+            "auto-fit is not the default"
         );
         let _ = std::fs::remove_dir_all(&folder);
     }

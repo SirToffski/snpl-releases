@@ -10,6 +10,43 @@ use snp_ligase_core::geom::{Point, Rect};
 
 use crate::tab::{ZOOM_MAX, ZOOM_MIN};
 
+/// The canvas size and content rectangle a viewport was last fitted to
+/// (NEXT_STEPS step 13). Auto-fit compares against it, so it fits when the
+/// layout changes and at no other time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FittedLayout {
+    pub canvas: Vec2,
+    pub content: Rect,
+}
+
+/// Whether auto-fit may act this frame (Step 13 review).
+///
+/// Not while a mouse button is down. Dragging an annotation or a pasted image
+/// past the image edge grows the content on every frame, and re-fitting
+/// mid-drag would shrink and slide the view under the user's hand. While the
+/// button is down the fitted layout simply stays stale, so the first frame
+/// after the release fits once.
+#[must_use]
+pub fn auto_fit_may_run(auto_fit: bool, pointer_busy: bool) -> bool {
+    auto_fit && !pointer_busy
+}
+
+/// Whether an auto-fit tab should fit right now (NEXT_STEPS step 13).
+///
+/// It fits when auto-fit is on and the canvas or the content is not what was
+/// fitted last: the window resized, the properties panel appeared, the crop
+/// changed the image, or a pasted image grew the export area. Anything else —
+/// every ordinary frame — must leave the user's view alone.
+#[must_use]
+pub fn should_refit(
+    auto_fit: bool,
+    fitted: Option<FittedLayout>,
+    canvas: Vec2,
+    content: Rect,
+) -> bool {
+    auto_fit && fitted != Some(FittedLayout { canvas, content })
+}
+
 /// How one tab's image is placed on the canvas.
 ///
 /// `origin` is where image pixel (0, 0) sits **on the canvas**, in points, and
@@ -28,6 +65,9 @@ pub struct Viewport {
     /// Set once the canvas has been sized, so a new tab can decide between 100%
     /// and fit (SPEC 7.2).
     pub initialised: bool,
+    /// What the viewport was last fitted to, for NEXT_STEPS step 13's
+    /// auto-fit. `None` until the tab's first frame.
+    pub fitted_to: Option<FittedLayout>,
 }
 
 impl Viewport {
@@ -43,6 +83,7 @@ impl Viewport {
             origin: Vec2::ZERO,
             canvas_min: Vec2::ZERO,
             initialised: false,
+            fitted_to: None,
         }
     }
 
@@ -99,14 +140,37 @@ impl Viewport {
 
     /// The zoom a new tab should start at (SPEC 7.2): 100%, or fitted when the
     /// content is larger than the canvas.
+    ///
+    /// The comparison is the content's **pixel** size against the canvas, not
+    /// the drawn size at the current zoom: auto-fit calls this again after a
+    /// manual zoom-out (NEXT_STEPS step 13), and "does the content fit" must
+    /// not depend on where the view happens to be. It also never upscales: a
+    /// small image stays at 100%.
     pub fn fit_if_larger(&mut self, content: Rect, canvas: Vec2) {
-        let drawn = self.drawn_size(content);
-        if drawn.x > canvas.x || drawn.y > canvas.y {
+        if content.w > canvas.x || content.h > canvas.y {
             self.fit(content, canvas, 16.0);
         } else {
             self.zoom = 1.0;
             self.centre(content, canvas);
         }
+    }
+
+    /// [`Viewport::fit_if_larger`] plus the record of what it fitted, which is
+    /// what every auto-fit path uses (NEXT_STEPS step 13): the tab's first
+    /// frame, a re-fit after a layout change, and turning auto-fit back on.
+    pub fn fit_for_auto_fit(&mut self, content: Rect, canvas: Vec2) {
+        self.fit_if_larger(content, canvas);
+        self.fitted_to = Some(FittedLayout { canvas, content });
+    }
+
+    /// Re-fits for auto-fit when the canvas or the content changed since the
+    /// last fit (NEXT_STEPS step 13). Returns whether it fitted.
+    pub fn refit_if_needed(&mut self, auto_fit: bool, content: Rect, canvas: Vec2) -> bool {
+        if !should_refit(auto_fit, self.fitted_to, canvas, content) {
+            return false;
+        }
+        self.fit_for_auto_fit(content, canvas);
+        true
     }
 
     /// Puts `content` in the middle of the canvas at the current zoom, or at
@@ -211,6 +275,7 @@ mod tests {
             origin: Vec2::new(37.0, -12.0),
             canvas_min: CANVAS_MIN,
             initialised: true,
+            fitted_to: None,
         };
         let image_point = Point::new(123.0, 456.0);
         let back = viewport.to_image(viewport.to_screen(image_point));
@@ -259,6 +324,7 @@ mod tests {
             origin: Vec2::new(40.0, 0.0),
             canvas_min: CANVAS_MIN,
             initialised: true,
+            fitted_to: None,
         };
         viewport.clamp_origin(IMAGE, CANVAS);
         assert_eq!(viewport.origin.x, 0.0, "it over-panned to the right");
@@ -295,6 +361,7 @@ mod tests {
             origin: Vec2::ZERO,
             canvas_min: CANVAS_MIN,
             initialised: true,
+            fitted_to: None,
         };
 
         // The content is bigger than the canvas, so panning up-until the top
@@ -336,6 +403,7 @@ mod tests {
             origin: Vec2::ZERO,
             canvas_min: CANVAS_MIN,
             initialised: true,
+            fitted_to: None,
         };
         viewport.clamp_origin(content, CANVAS);
         let centre = viewport.to_screen(content.center());
@@ -445,6 +513,7 @@ mod tests {
             origin: Vec2::ZERO,
             canvas_min: CANVAS_MIN,
             initialised: true,
+            fitted_to: None,
         };
         // Push it far away in both directions.
         for _ in 0..50 {
@@ -484,6 +553,175 @@ mod tests {
         assert!((viewport.origin.x - (CANVAS.x - 100.0) / 2.0).abs() < 0.001);
     }
 
+    /// NEXT_STEPS step 13: auto-fit re-fits when the canvas or the content
+    /// changed, and at no other time. The decision is a pure function so the
+    /// canvas cannot accidentally re-fit every frame.
+    #[test]
+    fn auto_fit_refits_only_when_the_canvas_or_the_content_changed() {
+        let fitted = Some(FittedLayout {
+            canvas: CANVAS,
+            content: IMAGE,
+        });
+        assert!(
+            should_refit(true, None, CANVAS, IMAGE),
+            "auto-fit with nothing fitted yet must fit"
+        );
+        assert!(
+            !should_refit(true, fitted, CANVAS, IMAGE),
+            "nothing changed, so nothing may move"
+        );
+        assert!(
+            should_refit(true, fitted, Vec2::new(900.0, 600.0), IMAGE),
+            "a resized window must re-fit"
+        );
+        assert!(
+            should_refit(
+                true,
+                fitted,
+                CANVAS,
+                Rect {
+                    w: IMAGE.w + 40.0,
+                    ..IMAGE
+                }
+            ),
+            "a grown content rect (a pasted image) must re-fit"
+        );
+        for (canvas, content) in [
+            (CANVAS, IMAGE),
+            (Vec2::new(900.0, 600.0), IMAGE),
+            (
+                CANVAS,
+                Rect {
+                    w: IMAGE.w + 40.0,
+                    ..IMAGE
+                },
+            ),
+        ] {
+            assert!(
+                !should_refit(false, fitted, canvas, content),
+                "auto-fit is off, so {canvas:?} / {content:?} must not re-fit"
+            );
+        }
+    }
+
+    /// Step 13 review: content that grows during a drag (an annotation pushed
+    /// past the image edge) must not re-fit under the pointer; the release
+    /// re-fits exactly once.
+    #[test]
+    fn auto_fit_waits_for_the_drag_to_end() {
+        let mut viewport = Viewport::new();
+        viewport.canvas_min = CANVAS_MIN;
+        assert!(viewport.refit_if_needed(auto_fit_may_run(true, false), IMAGE, CANVAS));
+        let before = (viewport.zoom, viewport.origin);
+
+        // Mid-drag, the content grows by 200 px to the left on every frame.
+        for step in 1..=5 {
+            let grown = Rect::new(
+                -40.0 * step as f32,
+                0.0,
+                IMAGE.w + 40.0 * step as f32,
+                IMAGE.h,
+            );
+            assert!(
+                !viewport.refit_if_needed(auto_fit_may_run(true, true), grown, CANVAS),
+                "auto-fit re-fitted while the button was down (frame {step})"
+            );
+            assert_eq!(
+                (viewport.zoom, viewport.origin),
+                before,
+                "the view moved mid-drag"
+            );
+        }
+
+        // The release: one re-fit to the final content, then nothing.
+        let last = Rect::new(-200.0, 0.0, IMAGE.w + 200.0, IMAGE.h);
+        assert!(viewport.refit_if_needed(auto_fit_may_run(true, false), last, CANVAS));
+        assert!(!viewport.refit_if_needed(auto_fit_may_run(true, false), last, CANVAS));
+    }
+
+    /// NEXT_STEPS step 13: with auto-fit on a resize re-fits; with it off the
+    /// zoom stays where the user left it.
+    #[test]
+    fn a_resize_re_fits_with_auto_fit_on_and_leaves_the_zoom_alone_with_it_off() {
+        let mut viewport = Viewport::new();
+        viewport.canvas_min = CANVAS_MIN;
+        assert!(
+            viewport.refit_if_needed(true, IMAGE, CANVAS),
+            "the first check has nothing fitted yet, so it has to fit"
+        );
+        assert!(
+            !viewport.refit_if_needed(true, IMAGE, CANVAS),
+            "a second frame with nothing changed must not fit again"
+        );
+        let fitted = viewport.zoom;
+        assert_eq!(
+            viewport.fitted_to,
+            Some(FittedLayout {
+                canvas: CANVAS,
+                content: IMAGE
+            })
+        );
+
+        // The window shrinks.
+        let smaller = Vec2::new(400.0, 300.0);
+        assert!(
+            !viewport.refit_if_needed(false, IMAGE, smaller),
+            "with auto-fit off a resize must not re-fit"
+        );
+        assert_eq!(viewport.zoom, fitted, "the zoom changed with auto-fit off");
+
+        // And with auto-fit on it does.
+        assert!(viewport.refit_if_needed(true, IMAGE, smaller));
+        let refitted = viewport.zoom;
+        assert!(
+            refitted < fitted,
+            "the smaller window did not re-fit: {fitted} -> {refitted}"
+        );
+        let drawn = viewport.drawn_size(IMAGE);
+        assert!(
+            drawn.x <= smaller.x && drawn.y <= smaller.y,
+            "the content does not fit the smaller canvas: {drawn:?}"
+        );
+        assert_eq!(
+            viewport.fitted_to,
+            Some(FittedLayout {
+                canvas: smaller,
+                content: IMAGE
+            })
+        );
+    }
+
+    /// NEXT_STEPS step 13: turning auto-fit back on fits immediately, with the
+    /// same rule as a new tab (100% when it fits, never upscaled).
+    #[test]
+    fn re_arming_auto_fit_fits_now_and_never_upscales() {
+        let mut viewport = Viewport {
+            zoom: 0.25,
+            origin: Vec2::ZERO,
+            canvas_min: CANVAS_MIN,
+            initialised: true,
+            fitted_to: None,
+        };
+        viewport.fit_for_auto_fit(IMAGE, CANVAS);
+        assert!(
+            viewport.zoom > 0.25 && viewport.zoom < 1.0,
+            "the big image was not fitted: {}",
+            viewport.zoom
+        );
+
+        let small = Rect {
+            w: 100.0,
+            h: 80.0,
+            ..IMAGE
+        };
+        viewport.fit_for_auto_fit(small, CANVAS);
+        assert!(
+            (viewport.zoom - 1.0).abs() < 0.001,
+            "a small image must stay at 100%, not be upscaled: {}",
+            viewport.zoom
+        );
+    }
+
     #[test]
     fn a_drag_pan_uses_the_per_frame_delta_not_the_total() {
         // R02: three frames of +5 points move the image 15 points, not 30.
@@ -492,6 +730,7 @@ mod tests {
             origin: Vec2::new(-50.0, -50.0),
             canvas_min: CANVAS_MIN,
             initialised: true,
+            fitted_to: None,
         };
         for _ in 0..3 {
             viewport.pan_by_drag(Vec2::new(5.0, 5.0), IMAGE, CANVAS);

@@ -48,6 +48,11 @@ pub struct Tab {
     pub document: Document,
     /// Zoom and pan of the canvas.
     pub viewport: Viewport,
+    /// Auto-fit to the window (NEXT_STEPS step 13): while true the canvas
+    /// re-fits when its size or the content changes. A manual zoom clears it
+    /// for this tab only, so a zoom here cannot stop the next capture from
+    /// fitting. A new tab takes the "Auto-fit images to the window" setting.
+    pub auto_fit: bool,
     /// The selected annotation ids, in selection order.
     pub selection: Vec<u64>,
     /// Shown in place of the canvas when the image cannot be displayed
@@ -74,6 +79,9 @@ impl Tab {
             id: next_tab_id(),
             document,
             viewport: Viewport::new(),
+            // The setting's default; `push_tab` replaces it with the setting
+            // the user chose (NEXT_STEPS step 13).
+            auto_fit: true,
             selection: Vec::new(),
             display_error: None,
             path: None,
@@ -375,8 +383,9 @@ impl Tab {
             return area;
         }
         for annotation in &self.document.annotations {
-            // Blur and Highlight only ever draw inside the image, so they can
-            // never grow it (J1).
+            // Blur and Highlight only ever draw where the base image or a
+            // pasted image already is (NEXT_STEPS step 12), so they can never
+            // grow it (J1).
             if annotation.kind.is_effect() {
                 continue;
             }
@@ -508,6 +517,10 @@ impl Tab {
     /// [`Tab::base_texture`]: a new sprite is uploaded with the sampling the
     /// current zoom asks for.
     ///
+    /// `expand` is the "annotations outside the image" mode: with it the effect
+    /// layers reach the pasted images, so a Blur or Highlight outside the
+    /// original screenshot has pixels to read (NEXT_STEPS step 12).
+    ///
     /// [`Gesture::is_moving`]: crate::tools::Gesture::is_moving
     pub fn sprite_texture(
         &mut self,
@@ -516,15 +529,16 @@ impl Tab {
         fonts: &mut Fonts,
         zoom: f32,
         moving: bool,
+        expand: bool,
     ) -> Option<SpriteTexture<'_>> {
         let annotation = self.document.find(id)?.clone();
         let base = match annotation.kind {
             // A Highlight reads the base with the images and blurs on it (R18).
-            snp_ligase_core::model::Kind::Highlight(_) => self.effects_base(fonts),
+            snp_ligase_core::model::Kind::Highlight(_) => self.effects_base(fonts, expand),
             // A Blur reads the base with the pasted images, so a blur over a
             // pasted image blurs the pasted pixels (NEXT_STEPS step 11).
-            snp_ligase_core::model::Kind::Blur(_) => self.images_base(fonts),
-            _ => Arc::clone(&self.document.base),
+            snp_ligase_core::model::Kind::Blur(_) => self.images_base(fonts, expand),
+            _ => render::Layer::whole(Arc::clone(&self.document.base)),
         };
         self.textures.sprite(
             ctx,
@@ -547,30 +561,34 @@ impl Tab {
     /// highlight over a blurred password never reveals it, and a blur over a
     /// pasted image really blurs the pasted pixels.
     ///
-    /// Both layers are cached together, keyed by the base image's address and
-    /// the list of Image and Blur annotations by value: they have to be rebuilt
-    /// whenever anything they depend on changes.
-    pub fn effects_base(&mut self, fonts: &mut Fonts) -> Arc<RgbaImage> {
-        self.refresh_layers(fonts);
+    /// With `expand` both layers also reach the pasted images outside the
+    /// original, which is what lets an effect work there (NEXT_STEPS step 12);
+    /// with Cut they are the base image alone, like the saved file.
+    ///
+    /// Both layers are cached together, keyed by the base image's address, the
+    /// list of Image and Blur annotations by value and the `expand` mode: they
+    /// have to be rebuilt whenever anything they depend on changes.
+    pub fn effects_base(&mut self, fonts: &mut Fonts, expand: bool) -> render::Layer {
+        self.refresh_layers(fonts, expand);
         self.textures
             .layers
             .as_ref()
-            .map(|cached| Arc::clone(&cached.blurred))
-            .unwrap_or_else(|| Arc::clone(&self.document.base))
+            .map(|cached| cached.blurred.clone())
+            .unwrap_or_else(|| render::Layer::whole(Arc::clone(&self.document.base)))
     }
 
     /// [`Tab::effects_base`]'s first layer: the base with the pasted images.
-    pub fn images_base(&mut self, fonts: &mut Fonts) -> Arc<RgbaImage> {
-        self.refresh_layers(fonts);
+    pub fn images_base(&mut self, fonts: &mut Fonts, expand: bool) -> render::Layer {
+        self.refresh_layers(fonts, expand);
         self.textures
             .layers
             .as_ref()
-            .map(|cached| Arc::clone(&cached.with_images))
-            .unwrap_or_else(|| Arc::clone(&self.document.base))
+            .map(|cached| cached.with_images.clone())
+            .unwrap_or_else(|| render::Layer::whole(Arc::clone(&self.document.base)))
     }
 
     /// Rebuilds the two layers when what they are made from has changed.
-    fn refresh_layers(&mut self, fonts: &mut Fonts) {
+    fn refresh_layers(&mut self, fonts: &mut Fonts, expand: bool) {
         let base = Arc::clone(&self.document.base);
         let images: Vec<Annotation> = self
             .document
@@ -588,18 +606,22 @@ impl Tab {
             .collect();
 
         let fresh = self.textures.layers.as_ref().is_some_and(|cached| {
-            Arc::ptr_eq(&cached.image, &base) && cached.images == images && cached.blurs == blurs
+            Arc::ptr_eq(&cached.image, &base)
+                && cached.images == images
+                && cached.blurs == blurs
+                && cached.expand == expand
         });
         if fresh {
             return;
         }
 
-        let with_images = render::images_base(&self.document, fonts);
+        let with_images = render::images_base(&self.document, fonts, expand);
         let blurred = render::effects_base_from(&self.document, &with_images, fonts);
         self.textures.layers = Some(CachedLayers {
             image: base,
             images,
             blurs,
+            expand,
             with_images,
             blurred,
         });
@@ -612,6 +634,24 @@ impl Tab {
     /// filter. The pixels are kept for exactly this.
     pub fn apply_sampling(&mut self, zoom: f32) {
         self.textures.apply_sampling(zoom);
+    }
+
+    /// A manual zoom: auto-fit stands down for **this** tab (NEXT_STEPS step
+    /// 13).
+    ///
+    /// Every zoom the user drives by hand — Ctrl+wheel, View > Zoom In/Out,
+    /// Actual Size — goes through here, so no path can miss turning auto-fit
+    /// off. Panning is not a zoom and does not.
+    pub fn user_zoomed(&mut self) {
+        if self.auto_fit {
+            self.auto_fit = false;
+            // Once per tab: the status bar dropping "Auto-fit" is the visible
+            // half, and this is the half a bug report needs (rule 11).
+            tracing::info!(
+                target: "snp_ligase::ui",
+                "a manual zoom turned auto-fit off for this tab"
+            );
+        }
     }
 
     /// Drops cached textures for annotations that no longer exist.
@@ -737,10 +777,13 @@ struct CachedLayers {
     images: Vec<Annotation>,
     /// The Blur annotations the second layer was built from, by value.
     blurs: Vec<Annotation>,
+    /// The "annotations outside the image" mode the layers were built for:
+    /// Expand makes them reach the pasted images (NEXT_STEPS step 12).
+    expand: bool,
     /// The base with the pasted images.
-    with_images: Arc<RgbaImage>,
+    with_images: render::Layer,
     /// That with the blurs: what Highlight sprites read.
-    blurred: Arc<RgbaImage>,
+    blurred: render::Layer,
 }
 
 /// The pixels behind a texture, kept so it can be re-uploaded when the sampling
@@ -766,18 +809,18 @@ struct CachedSprite {
     /// (NEXT_STEPS step 11, J2 and J3).
     painted: Option<snp_ligase_core::geom::RectI>,
     source: Annotation,
-    base: Arc<RgbaImage>,
+    base: render::Layer,
     nearest: bool,
 }
 
 impl CachedSprite {
     /// True when this texture still matches what the annotation asks for.
     ///
-    /// The base is compared by address: a Blur or Highlight sprite is made
-    /// from the base image, and two equal images still rasterize the same, but
-    /// only the same buffer can be assumed to.
-    fn matches(&self, annotation: &Annotation, base: &Arc<RgbaImage>) -> bool {
-        self.source == *annotation && Arc::ptr_eq(&self.base, base)
+    /// The layer is compared by address: a Blur or Highlight sprite is made
+    /// from it, and two equal images still rasterize the same, but only the
+    /// same buffer can be assumed to.
+    fn matches(&self, annotation: &Annotation, base: &render::Layer) -> bool {
+        self.source == *annotation && self.base.shares_pixels(base)
     }
 }
 
@@ -803,9 +846,9 @@ pub fn wants_nearest(zoom: f32) -> bool {
 struct SpriteSource<'a> {
     /// The annotation as it is now.
     annotation: &'a Annotation,
-    /// The image its pixels come from (the base, or the blurred base for a
-    /// Highlight).
-    base: &'a Arc<RgbaImage>,
+    /// The layer its pixels come from (the base, the base with the pasted
+    /// images for a Blur, or that with the blurs for a Highlight).
+    base: &'a render::Layer,
     /// The sampling changes at 200% (SPEC 7.2).
     zoom: f32,
     /// True while the selection is being moved: only then may a translated
@@ -882,7 +925,7 @@ impl TextureCache {
         }
 
         if stale && reuse.is_none() {
-            let sprite: Sprite = render::rasterize(annotation, base, fonts)?;
+            let sprite: Sprite = render::rasterize_layer(annotation, base, fonts)?;
             let pixels = color_image_from_sprite(&sprite);
             let texture = ctx.load_texture(
                 format!("annotation:{id}"),
@@ -903,7 +946,7 @@ impl TextureCache {
                     origin: sprite.origin,
                     painted: render::painted_bounds(&sprite),
                     source: annotation.clone(),
-                    base: Arc::clone(base),
+                    base: base.clone(),
                     nearest: wants_nearest(zoom),
                 },
             );
@@ -942,7 +985,7 @@ impl TextureCache {
         base: &Arc<RgbaImage>,
     ) -> Option<snp_ligase_core::geom::RectI> {
         let cached = self.sprites.get(&annotation.id)?;
-        if !Arc::ptr_eq(&cached.base, base) {
+        if !cached.base.is_buffer(base) {
             return None;
         }
         if cached.source == *annotation {
@@ -1090,9 +1133,9 @@ mod tests {
         // The canvas rasterizes both sprites.
         let ctx = egui::Context::default();
         let mut fonts = Fonts::bundled();
-        tab.sprite_texture(&ctx, text, &mut fonts, 1.0, false)
+        tab.sprite_texture(&ctx, text, &mut fonts, 1.0, false, false)
             .expect("a text sprite");
-        tab.sprite_texture(&ctx, outside, &mut fonts, 1.0, false)
+        tab.sprite_texture(&ctx, outside, &mut fonts, 1.0, false, false)
             .expect("a rectangle sprite");
 
         // From now on the rectangle includes the painted pixels: the box top
@@ -1111,6 +1154,61 @@ mod tests {
 
         // "Cut" is still the image itself.
         assert_eq!(tab.export_rect(false), Rect::new(0.0, 0.0, 200.0, 100.0));
+    }
+
+    /// NEXT_STEPS step 12: the canvas makes an effect sprite from the cached
+    /// layer, and the export composites the same pixels. A Blur over a pasted
+    /// image outside the base is the case step 11 got wrong, so this pins the
+    /// two paths together there.
+    #[test]
+    fn the_cached_effect_layer_and_the_export_agree_outside_the_base() {
+        let mut tab = tab();
+        let pasted: RgbaImage = RgbaImage::from_fn(60, 40, |x, _y| {
+            if (x / 6) % 2 == 0 {
+                image::Rgba([0, 0, 0, 255])
+            } else {
+                image::Rgba([255, 255, 255, 255])
+            }
+        });
+        tab.document
+            .push(Kind::Image(snp_ligase_core::model::ImageA {
+                pos: Point::new(220.0, 20.0),
+                image: Arc::new(pasted),
+            }));
+        let blur = tab.document.push(Kind::Blur(snp_ligase_core::model::BlurA {
+            rect: Rect::new(220.0, 20.0, 60.0, 40.0),
+            radius: 8.0,
+        }));
+
+        let mut fonts = Fonts::bundled();
+        let options = FlattenOptions {
+            expand: true,
+            fill: Some([255, 255, 255, 255]),
+        };
+
+        // The canvas path: the cached layer, rasterized against it.
+        let layer = tab.images_base(&mut fonts, options.expand);
+        let annotation = tab.document.find(blur).expect("the blur").clone();
+        let sprite = render::rasterize_layer(&annotation, &layer, &mut fonts)
+            .expect("a blur sprite to the right of the base");
+
+        // The export path, from the same tab.
+        let saved = tab.flattened(&mut fonts, &options);
+
+        assert_eq!(sprite.origin, (220, 20));
+        for row in 0..sprite.pixmap.height() {
+            for column in 0..sprite.pixmap.width() {
+                let at = (row as usize * sprite.pixmap.width() as usize + column as usize) * 4;
+                let pixel = &sprite.pixmap.data()[at..at + 4];
+                assert_eq!(pixel[3], 255, "an effect sprite is opaque");
+                let (x, y) = (220 + column, 20 + row);
+                assert_eq!(
+                    &saved.get_pixel(x, y).0[..3],
+                    &pixel[..3],
+                    "the canvas and the export disagree at ({x}, {y})"
+                );
+            }
+        }
     }
 
     /// J3's measurement: what the export rectangle costs per frame with 20
@@ -1148,7 +1246,7 @@ mod tests {
             .map(|annotation| annotation.id)
             .collect();
         for id in ids {
-            tab.sprite_texture(&ctx, id, &mut fonts, 1.0, false)
+            tab.sprite_texture(&ctx, id, &mut fonts, 1.0, false, false)
                 .expect("a sprite");
         }
 
@@ -1763,14 +1861,14 @@ mod tests {
 
         let (first_texture, first_origin) = {
             let first = tab
-                .sprite_texture(&ctx, id, &mut fonts, 1.0, false)
+                .sprite_texture(&ctx, id, &mut fonts, 1.0, false, false)
                 .expect("a sprite");
             (first.texture.id(), first.origin)
         };
 
         tools::select::translate_selection(&mut tab, 7.0, 5.0);
         let moved = tab
-            .sprite_texture(&ctx, id, &mut fonts, 1.0, true)
+            .sprite_texture(&ctx, id, &mut fonts, 1.0, true, false)
             .expect("a sprite");
         assert_eq!(
             moved.texture.id(),
@@ -1787,7 +1885,7 @@ mod tests {
         // position the document now has.
         let (after_texture, after_origin) = {
             let after = tab
-                .sprite_texture(&ctx, id, &mut fonts, 1.0, false)
+                .sprite_texture(&ctx, id, &mut fonts, 1.0, false, false)
                 .expect("a sprite");
             (after.texture.id(), after.origin)
         };
@@ -1804,7 +1902,7 @@ mod tests {
             rect.rect.w += 20.0;
         }
         let resized = tab
-            .sprite_texture(&ctx, id, &mut fonts, 1.0, false)
+            .sprite_texture(&ctx, id, &mut fonts, 1.0, false, false)
             .expect("a sprite");
         assert_ne!(
             resized.texture.id(),
@@ -1820,13 +1918,13 @@ mod tests {
         }));
         tab.select_only(Some(blur));
         let first_blur = tab
-            .sprite_texture(&ctx, blur, &mut fonts, 1.0, false)
+            .sprite_texture(&ctx, blur, &mut fonts, 1.0, false, false)
             .expect("a sprite")
             .texture
             .id();
         tools::select::translate_selection(&mut tab, 3.0, 3.0);
         let moved_blur = tab
-            .sprite_texture(&ctx, blur, &mut fonts, 1.0, true)
+            .sprite_texture(&ctx, blur, &mut fonts, 1.0, true, false)
             .expect("a sprite")
             .texture
             .id();
@@ -1850,7 +1948,7 @@ mod tests {
         tab.select_only(Some(id));
 
         let first_texture = tab
-            .sprite_texture(&ctx, id, &mut fonts, 1.0, false)
+            .sprite_texture(&ctx, id, &mut fonts, 1.0, false, false)
             .expect("a sprite")
             .texture
             .id();
@@ -1860,7 +1958,7 @@ mod tests {
         tools::select::translate_selection(&mut tab, 7.5, 5.5);
         let during_origin = {
             let during = tab
-                .sprite_texture(&ctx, id, &mut fonts, 1.0, true)
+                .sprite_texture(&ctx, id, &mut fonts, 1.0, true, false)
                 .expect("a sprite");
             assert_eq!(
                 during.texture.id(),
@@ -1871,7 +1969,7 @@ mod tests {
         };
 
         let after = tab
-            .sprite_texture(&ctx, id, &mut fonts, 1.0, false)
+            .sprite_texture(&ctx, id, &mut fonts, 1.0, false, false)
             .expect("a sprite");
         assert_ne!(
             after.texture.id(),

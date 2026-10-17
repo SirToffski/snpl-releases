@@ -164,6 +164,8 @@ fn route_plain(key: Key, shift: bool) -> Option<Action> {
         Key::N => Action::Tool(Tool::Number),
         Key::H => Action::Tool(Tool::Highlight),
         Key::B => Action::Tool(Tool::Blur),
+        // NEXT_STEPS step 14b: the Freehand tool takes the free key F.
+        Key::F => Action::Tool(Tool::Freehand),
         Key::C => Action::Tool(Tool::Crop),
         Key::Delete | Key::Backspace => Action::Delete,
         Key::Escape => Action::CancelGesture,
@@ -577,6 +579,7 @@ mod tests {
             Key::L,
             Key::A,
             Key::R,
+            Key::F,
             Key::Delete,
             Key::Backspace,
             Key::Escape,
@@ -632,6 +635,11 @@ mod tests {
             key(Key::R, false, false, false),
             Some(Action::Tool(Tool::Rectangle))
         );
+        assert_eq!(
+            key(Key::F, false, false, false),
+            Some(Action::Tool(Tool::Freehand)),
+            "NEXT_STEPS step 14b: F selects the Freehand tool"
+        );
         assert_eq!(key(Key::Delete, false, false, false), Some(Action::Delete));
         assert_eq!(
             key(Key::Backspace, false, false, false),
@@ -686,6 +694,7 @@ mod tests {
                 "N" => Key::N,
                 "H" => Key::H,
                 "B" => Key::B,
+                "F" => Key::F,
                 "C" => Key::C,
                 other => panic!("unexpected key {other}"),
             };

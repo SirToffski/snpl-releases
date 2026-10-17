@@ -232,6 +232,14 @@ pub fn style_of(annotation: &snp_ligase_core::model::Annotation) -> Option<ToolS
             shadow: annotation.shadow,
             ..fallback
         },
+        // A freehand stroke's style is its stroke colour and width, plus the
+        // shadow (NEXT_STEPS step 14a).
+        Kind::Freehand(stroke) => ToolStyle {
+            stroke_color: stroke.stroke.color,
+            stroke_width: stroke.stroke.width,
+            shadow: annotation.shadow,
+            ..fallback
+        },
     })
 }
 
@@ -893,6 +901,14 @@ fn write_into(annotation: &mut snp_ligase_core::model::Annotation, property: &St
                 annotation.shadow = *shadow;
             }
         }
+        // A freehand stroke takes the stroke colour, width and shadow
+        // (NEXT_STEPS step 14a).
+        Kind::Freehand(stroke) => match property {
+            StyleProperty::StrokeColour(colour) => stroke.stroke.color = *colour,
+            StyleProperty::StrokeWidth(width) => stroke.stroke.width = *width,
+            StyleProperty::Shadow(shadow) => annotation.shadow = *shadow,
+            _ => {}
+        },
     }
 }
 
@@ -1071,6 +1087,47 @@ mod tests {
                 .stroke_color,
             [1, 2, 3, 255],
             "the Arrow tool did not learn the new colour"
+        );
+    }
+
+    #[test]
+    fn a_freehand_change_updates_the_freehand_defaults_and_no_other_tool() {
+        // NEXT_STEPS step 14b: a stroke owns the Freehand tool's defaults, the
+        // way a line owns Line's (SPEC 7.7).
+        let mut tab = tab();
+        let id = tab
+            .document
+            .push(Kind::Freehand(snp_ligase_core::model::FreehandA {
+                points: vec![Point::new(0.0, 0.0), Point::new(50.0, 20.0)],
+                stroke: snp_ligase_core::model::defaults::stroke(),
+            }));
+        tab.select_only(Some(id));
+        let mut styles = ToolStyles::default();
+
+        let mut edited = style_of(tab.selected().expect("selected")).expect("a style");
+        edited.stroke_color = [7, 8, 9, 255];
+        apply(&mut tab, &mut styles, &[id], &edited);
+
+        let Kind::Freehand(stroke) = &tab.document.find(id).expect("still there").kind else {
+            panic!("expected a freehand stroke");
+        };
+        assert_eq!(
+            stroke.stroke.color,
+            [7, 8, 9, 255],
+            "not written to the stroke"
+        );
+        assert_eq!(
+            styles
+                .get(Tool::Freehand)
+                .expect("a freehand style")
+                .stroke_color,
+            [7, 8, 9, 255],
+            "the Freehand tool did not learn the new colour"
+        );
+        assert_eq!(
+            styles.get(Tool::Line).expect("a line style").stroke_color,
+            snp_ligase_core::model::defaults::STROKE_COLOR,
+            "a freehand change leaked into the Line defaults"
         );
     }
 

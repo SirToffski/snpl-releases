@@ -108,6 +108,9 @@ pub fn handles(a: &Annotation) -> Vec<Handle> {
         // A pasted image moves only; resizing it is out of scope (NEXT_STEPS
         // step 11).
         Kind::Image(_) => Vec::new(),
+        // A freehand stroke moves only: point handles on a scribble would be
+        // hundreds of handles and no use (NEXT_STEPS step 14a).
+        Kind::Freehand(_) => Vec::new(),
         Kind::Number(number) => number
             .pointer_tip
             .map(|tip| Handle {
@@ -184,6 +187,7 @@ pub fn hit_test(a: &Annotation, p: Point, tolerance: f32, fonts: &mut Fonts) -> 
         // A pasted image is hit anywhere inside it, like an effect.
         Kind::Image(_) => render::shape_bounds(a, fonts).contains(p),
         Kind::Number(number) => hit_number(number, p, tolerance),
+        Kind::Freehand(stroke) => hit_freehand(stroke, p, tolerance),
     }
 }
 
@@ -229,6 +233,15 @@ fn edge_distance(rect: Rect, p: Point) -> f32 {
 fn hit_path(path: &PathA, p: Point, tolerance: f32) -> bool {
     let reach = path.stroke.width / 2.0 + tolerance;
     let line = path::polyline(&path.points, path.curved);
+    line.windows(2)
+        .any(|pair| distance_to_segment(p, pair[0], pair[1]) <= reach)
+}
+
+/// A freehand stroke is hit near its curve only: it is not a filled shape, so
+/// the inside of its bounding box is not part of it (NEXT_STEPS step 14a).
+fn hit_freehand(stroke: &crate::model::FreehandA, p: Point, tolerance: f32) -> bool {
+    let reach = stroke.stroke.width / 2.0 + tolerance;
+    let line = path::polyline(&stroke.points, true);
     line.windows(2)
         .any(|pair| distance_to_segment(p, pair[0], pair[1]) <= reach)
 }
@@ -390,6 +403,11 @@ pub fn translate(a: &mut Annotation, dx: f32, dy: f32) {
                 *point = *point + delta;
             }
         }
+        Kind::Freehand(stroke) => {
+            for point in &mut stroke.points {
+                *point = *point + delta;
+            }
+        }
         Kind::Text(text) => text.pos = text.pos + delta,
         Kind::Number(number) => {
             number.center = number.center + delta;
@@ -436,6 +454,10 @@ pub fn translation_between(from: &Annotation, to: &Annotation) -> Option<(f32, f
         (Kind::Text(a), Kind::Text(b)) => (b.pos.x - a.pos.x, b.pos.y - a.pos.y),
         (Kind::Number(a), Kind::Number(b)) => (b.center.x - a.center.x, b.center.y - a.center.y),
         (Kind::Image(a), Kind::Image(b)) => (b.pos.x - a.pos.x, b.pos.y - a.pos.y),
+        (Kind::Freehand(a), Kind::Freehand(b)) => {
+            let (first, last) = (a.points.first()?, b.points.first()?);
+            (last.x - first.x, last.y - first.y)
+        }
         _ => return None,
     };
     moved_shape_within(from, to, dx, dy).then_some((dx, dy))
@@ -503,6 +525,11 @@ fn moved_shape_within(from: &Annotation, to: &Annotation, dx: f32, dy: f32) -> b
         // images still rasterize the same, but only the same buffer can be
         // assumed to.
         (Kind::Image(a), Kind::Image(b)) => Arc::ptr_eq(&a.image, &b.image) && moved(a.pos, b.pos),
+        // A freehand stroke's shape is its points and its style
+        // (NEXT_STEPS step 14a).
+        (Kind::Freehand(a), Kind::Freehand(b)) => {
+            same_points(&a.points, &b.points) && a.stroke == b.stroke
+        }
         // Effects read the base image under their rectangle: never reused.
         _ => false,
     }
@@ -617,6 +644,22 @@ mod tests {
         }
     }
 
+    /// A horizontal freehand stroke at y = 20, 40 px long, 8 px wide
+    /// (NEXT_STEPS step 14a).
+    fn freehand() -> Annotation {
+        Annotation {
+            id: 8,
+            shadow: false,
+            kind: Kind::Freehand(crate::model::FreehandA {
+                points: vec![Point::new(10.0, 20.0), Point::new(50.0, 20.0)],
+                stroke: Stroke {
+                    width: 8.0,
+                    ..defaults::stroke()
+                },
+            }),
+        }
+    }
+
     fn fonts() -> Fonts {
         Fonts::bundled()
     }
@@ -721,6 +764,102 @@ mod tests {
             handles(&annotation).is_empty(),
             "a pasted image has no handles"
         );
+    }
+
+    #[test]
+    fn a_freehand_stroke_is_hit_on_the_stroke_and_not_inside_its_box() {
+        // NEXT_STEPS step 14a: distance to the polyline <= tolerance + half the
+        // width. A stroke is not a filled shape, so a point inside its bounding
+        // box but away from the line must miss.
+        let annotation = freehand();
+        let mut fonts = fonts();
+
+        assert!(hit_test(
+            &annotation,
+            Point::new(30.0, 20.0),
+            1.0,
+            &mut fonts
+        ));
+        // 4 px off the line: exactly at the edge of the stroke.
+        assert!(hit_test(
+            &annotation,
+            Point::new(30.0, 24.0),
+            1.0,
+            &mut fonts
+        ));
+        // 6 px off: outside half the width plus the tolerance.
+        assert!(!hit_test(
+            &annotation,
+            Point::new(30.0, 26.0),
+            1.0,
+            &mut fonts
+        ));
+        // Past the end: the round cap reaches half the width beyond it.
+        assert!(hit_test(
+            &annotation,
+            Point::new(6.0, 20.0),
+            1.0,
+            &mut fonts
+        ));
+        assert!(!hit_test(
+            &annotation,
+            Point::new(3.0, 20.0),
+            1.0,
+            &mut fonts
+        ));
+
+        assert!(
+            handles(&annotation).is_empty(),
+            "a freehand stroke moves only"
+        );
+
+        // A diagonal: a point inside its bounding box but far from the stroke
+        // must miss — the box is not the shape.
+        let diagonal = Annotation {
+            id: 9,
+            shadow: false,
+            kind: Kind::Freehand(crate::model::FreehandA {
+                points: vec![Point::new(10.0, 10.0), Point::new(50.0, 50.0)],
+                stroke: Stroke {
+                    width: 4.0,
+                    ..defaults::stroke()
+                },
+            }),
+        };
+        assert!(hit_test(&diagonal, Point::new(30.0, 30.0), 1.0, &mut fonts));
+        assert!(!hit_test(
+            &diagonal,
+            Point::new(30.0, 14.0),
+            1.0,
+            &mut fonts
+        ));
+    }
+
+    #[test]
+    fn crop_moves_a_freehand_stroke_by_the_crop_origin() {
+        let mut doc = Document::new(RgbaImage::new(100, 80));
+        doc.push(freehand().kind);
+        let cropped = crop(&doc, Rect::new(5.0, 10.0, 60.0, 40.0));
+
+        let Kind::Freehand(stroke) = &cropped.annotations[0].kind else {
+            panic!("expected a freehand stroke");
+        };
+        assert_eq!(
+            stroke.points,
+            vec![Point::new(5.0, 10.0), Point::new(45.0, 10.0)]
+        );
+    }
+
+    #[test]
+    fn a_restyled_freehand_stroke_is_not_a_translation() {
+        // The sprite cache must not reuse the old texture when the stroke's
+        // colour or width changes (NEXT_STEPS step 14a).
+        let original = freehand();
+        let mut restyled = original.clone();
+        if let Kind::Freehand(stroke) = &mut restyled.kind {
+            stroke.stroke.width = 12.0;
+        }
+        assert_eq!(translation_between(&original, &restyled), None);
     }
 
     #[test]
@@ -962,6 +1101,7 @@ mod tests {
             },
             highlight(),
             pasted_image(),
+            freehand(),
         ];
 
         let mut fonts = fonts();
@@ -1141,6 +1281,7 @@ mod tests {
                     pointer_tip: Some(Point::new(90.0, 80.0)),
                 }),
             },
+            freehand(),
         ];
 
         for annotation in &cases {

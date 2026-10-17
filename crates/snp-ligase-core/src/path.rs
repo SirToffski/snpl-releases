@@ -216,6 +216,78 @@ pub fn polyline(points: &[Point], curved: bool) -> Vec<Point> {
     out
 }
 
+/// Ramer–Douglas–Peucker: drops the samples that stay within `tolerance` of
+/// the line through the ends of their piece (NEXT_STEPS step 14a).
+///
+/// The first and last points are always kept. A freehand drag arrives with one
+/// point per pointer event, so this is what turns a scribble into a handful of
+/// points before it goes into the model.
+///
+/// Iterative rather than recursive: a scribble can be thousands of samples
+/// long, and the worst case would otherwise be a deep stack.
+#[must_use]
+pub fn simplify(points: &[Point], tolerance: f32) -> Vec<Point> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+
+    let mut keep = vec![false; points.len()];
+    keep[0] = true;
+    keep[points.len() - 1] = true;
+
+    // Distance alone cannot see a stroke that retraces its own line (a
+    // back-and-forth scribble crossing something out): every sample lies on
+    // the segment between the ends. So every turn sharper than 90° is kept
+    // first, and the simplification runs between those anchors (Step 14a
+    // review). Repeated samples are skipped when finding the direction.
+    let mut previous: Option<Point> = None;
+    for index in 1..points.len() {
+        let delta = points[index] - points[index - 1];
+        if delta.x == 0.0 && delta.y == 0.0 {
+            continue;
+        }
+        if let Some(before) = previous
+            && before.x * delta.x + before.y * delta.y < 0.0
+        {
+            keep[index - 1] = true;
+        }
+        previous = Some(delta);
+    }
+    let anchors: Vec<usize> = (0..points.len()).filter(|&index| keep[index]).collect();
+
+    let mut stack: Vec<(usize, usize)> =
+        anchors.windows(2).map(|pair| (pair[0], pair[1])).collect();
+    while let Some((start, end)) = stack.pop() {
+        if end <= start + 1 {
+            continue;
+        }
+        let (a, b) = (points[start], points[end]);
+        let mut worst = tolerance;
+        let mut worst_index = None;
+        for (index, &point) in points.iter().enumerate().take(end).skip(start + 1) {
+            // The *segment*, not the infinite line: a scribble that doubles
+            // back along one row lies on the line but far from the segment
+            // (Step 14a review).
+            let distance = crate::geom::distance_to_segment(point, a, b);
+            if distance > worst {
+                worst = distance;
+                worst_index = Some(index);
+            }
+        }
+        if let Some(index) = worst_index {
+            keep[index] = true;
+            stack.push((start, index));
+            stack.push((index, end));
+        }
+    }
+
+    points
+        .iter()
+        .zip(keep)
+        .filter_map(|(&point, kept)| kept.then_some(point))
+        .collect()
+}
+
 /// An arrowhead triangle, as three points (SPEC section 4.2).
 ///
 /// `tip` is exactly the path's end point. The triangle's **base** sits `L` back
@@ -474,5 +546,91 @@ mod tests {
     #[test]
     fn an_arrowhead_needs_a_direction() {
         assert!(ArrowHead::new(Point::new(5.0, 5.0), Point::new(5.0, 5.0), 4.0).is_none());
+    }
+
+    #[test]
+    fn simplifying_keeps_the_end_points_and_the_corners() {
+        // NEXT_STEPS step 14a: RDP at 0.5 px turns a densely sampled
+        // right-angle into its three corners.
+        let mut input = Vec::new();
+        for step in 0..=10 {
+            input.push(Point::new(step as f32 * 10.0, 0.0));
+        }
+        for step in 0..=10 {
+            input.push(Point::new(100.0, step as f32 * 10.0));
+        }
+
+        let simplified = simplify(&input, 0.5);
+
+        assert_eq!(simplified.first(), input.first());
+        assert_eq!(simplified.last(), input.last());
+        assert_eq!(
+            simplified,
+            points(&[(0.0, 0.0), (100.0, 0.0), (100.0, 100.0)])
+        );
+    }
+
+    #[test]
+    fn simplifying_drops_points_that_stay_near_the_line() {
+        let input = points(&[
+            (0.0, 0.0),
+            (10.0, 0.2),
+            (20.0, -0.15),
+            (30.0, 0.1),
+            (40.0, 0.0),
+        ]);
+        assert_eq!(simplify(&input, 0.5), points(&[(0.0, 0.0), (40.0, 0.0)]));
+
+        // A corner is not noise: a tolerance below its height keeps it.
+        let corner = points(&[(0.0, 0.0), (10.0, 0.0), (10.0, 10.0)]);
+        assert_eq!(simplify(&corner, 0.5), corner);
+    }
+
+    /// Step 14a review: a back-and-forth scribble along one row (crossing
+    /// something out) lies on the *line* through its ends but not on the
+    /// *segment*. Measuring against the infinite line collapsed it into one
+    /// straight stroke.
+    #[test]
+    fn simplifying_keeps_a_back_and_forth_scribble() {
+        let mut points = Vec::new();
+        for pass in 0..4 {
+            for step in 0..=20 {
+                let x = if pass % 2 == 0 {
+                    step as f32 * 5.0
+                } else {
+                    100.0 - step as f32 * 5.0
+                };
+                points.push(Point::new(x, 10.0));
+            }
+        }
+        let simplified = simplify(&points, 0.5);
+        // Three turns (at x = 100, 0, 100) plus the two ends.
+        assert!(
+            simplified.len() >= 5,
+            "the scribble collapsed to {} points: {simplified:?}",
+            simplified.len()
+        );
+        let turns = simplified
+            .windows(3)
+            .filter(|w| (w[1].x - w[0].x) * (w[2].x - w[1].x) < 0.0)
+            .count();
+        assert_eq!(
+            turns, 3,
+            "the back-and-forth turns are gone: {simplified:?}"
+        );
+    }
+
+    #[test]
+    fn simplifying_needs_three_points_and_survives_repeats() {
+        let two = points(&[(1.0, 1.0), (5.0, 5.0)]);
+        assert_eq!(simplify(&two, 0.5), two);
+
+        let one = points(&[(1.0, 1.0)]);
+        assert_eq!(simplify(&one, 0.5), one);
+
+        // Every sample in the same place: the line through the ends has zero
+        // length, which must not divide by zero or loop.
+        let repeated = points(&[(3.0, 3.0), (3.0, 3.0), (3.0, 3.0)]);
+        assert_eq!(simplify(&repeated, 0.5), points(&[(3.0, 3.0), (3.0, 3.0)]));
     }
 }

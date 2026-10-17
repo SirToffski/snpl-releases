@@ -11,6 +11,7 @@
 
 pub mod crop;
 pub mod draw;
+pub mod freehand;
 pub mod number;
 pub mod select;
 pub mod shape;
@@ -46,6 +47,14 @@ pub enum Gesture {
     None,
     /// A drawing tool is dragging out a shape.
     Drawing { start: Point },
+    /// The Freehand tool is collecting one stroke's pointer samples
+    /// (NEXT_STEPS step 14b).
+    ///
+    /// Unlike [`Gesture::Drawing`] this is not two points: it is every sample
+    /// the pointer reported while the button was held, deduplicated in screen
+    /// points. Nothing is added to the document until the release, which is
+    /// also where the Ramer–Douglas–Peucker simplification runs.
+    Freehand { points: Vec<Point> },
     /// The Shape tool is collecting vertices, one click each (SPEC 7.3).
     ///
     /// Unlike the other gestures this one is not held by the mouse button: it
@@ -133,6 +142,7 @@ impl Gesture {
         matches!(
             self,
             Self::Drawing { .. }
+                | Self::Freehand { .. }
                 | Self::Moving { .. }
                 | Self::Handle { .. }
                 | Self::NumberDrag { .. }
@@ -146,6 +156,16 @@ impl Gesture {
     pub fn drawing_from(&self) -> Option<Point> {
         match self {
             Self::Drawing { start } => Some(*start),
+            _ => None,
+        }
+    }
+
+    /// The samples of the stroke being drawn, for the canvas preview
+    /// (NEXT_STEPS step 14b).
+    #[must_use]
+    pub fn freehand_points(&self) -> Option<&[Point]> {
+        match self {
+            Self::Freehand { points } => Some(points),
             _ => None,
         }
     }
@@ -236,6 +256,7 @@ pub fn handle(
         Tool::Rectangle => draw::rectangle(tab, styles, input, gesture),
         Tool::Highlight => draw::highlight(tab, styles, input, gesture),
         Tool::Blur => draw::blur(tab, styles, input, gesture),
+        Tool::Freehand => freehand::handle(tab, styles, input, gesture),
         Tool::Shape => shape::handle(tab, styles, input, gesture),
         Tool::Number => number::handle(tab, styles, input, gesture),
         Tool::Crop => crop::handle(tab, input, gesture),
@@ -259,6 +280,9 @@ fn handle_panning(tab: &mut Tab, input: &CanvasInput) -> bool {
         // so `smooth_scroll_delta` is zero while Ctrl is held and the wheel branch
         // below would never fire (R03).
         if let Some(cursor) = input.pointer {
+            // NEXT_STEPS step 13: this is a manual zoom, so auto-fit stands
+            // down for this tab.
+            tab.user_zoomed();
             tab.viewport
                 .zoom_around(input.zoom_delta.clamp(0.8, 1.25), cursor, content, canvas);
         }
@@ -529,6 +553,7 @@ mod tests {
         let gestures = [
             Gesture::None,
             Gesture::Drawing { start: from },
+            Gesture::Freehand { points: vec![from] },
             Gesture::Polygon { points: vec![from] },
             Gesture::NumberDrag { center: from },
             Gesture::CropDraw { from, to: from },
@@ -639,6 +664,7 @@ mod tests {
         tab.viewport.origin = Vec2::new(-100.0, -80.0);
         let cursor = egui::pos2(400.0, 300.0);
         let anchor = tab.viewport.to_image(cursor);
+        assert!(tab.auto_fit, "a new tab starts with auto-fit on");
 
         let input = CanvasInput {
             pointer: Some(cursor),
@@ -670,6 +696,57 @@ mod tests {
         let now = tab.viewport.to_image(cursor);
         assert!((now.x - anchor.x).abs() < 0.01, "x moved");
         assert!((now.y - anchor.y).abs() < 0.01, "y moved");
+        // NEXT_STEPS step 13: Ctrl+wheel is a manual zoom, so auto-fit stands
+        // down for this tab.
+        assert!(
+            !tab.auto_fit,
+            "the Ctrl+wheel zoom did not turn auto-fit off"
+        );
+    }
+
+    /// NEXT_STEPS step 13: panning is not a zoom, so it must leave auto-fit
+    /// alone — the wheel, Shift+wheel and a middle-drag all keep it on.
+    #[test]
+    fn panning_leaves_auto_fit_on() {
+        let cases = [
+            CanvasInput {
+                wheel: Vec2::new(0.0, 40.0),
+                ..CanvasInput::default()
+            },
+            CanvasInput {
+                wheel: Vec2::new(40.0, 0.0),
+                shift: true,
+                ..CanvasInput::default()
+            },
+            CanvasInput {
+                middle_down: true,
+                drag_delta: Vec2::new(5.0, 5.0),
+                ..CanvasInput::default()
+            },
+        ];
+        for input in cases {
+            let mut tab = Tab::new(
+                snp_ligase_core::model::Document::new(image::RgbaImage::new(2000, 1500)),
+                "test".to_owned(),
+            );
+            tab.auto_fit = true;
+            let input = CanvasInput {
+                content: snp_ligase_core::geom::Rect::new(0.0, 0.0, 2000.0, 1500.0),
+                ..input
+            };
+            let mut gesture = Gesture::None;
+            let mut active_point = None;
+            handle(
+                &mut tab,
+                Tool::Select,
+                &ToolStyles::default(),
+                &input,
+                &mut fonts(),
+                &mut gesture,
+                &mut active_point,
+            );
+            assert!(tab.auto_fit, "panning ({input:?}) turned auto-fit off");
+        }
     }
 
     #[test]
@@ -723,6 +800,9 @@ mod tests {
         for gesture in [
             Gesture::Drawing {
                 start: Point::new(0.0, 0.0),
+            },
+            Gesture::Freehand {
+                points: vec![Point::new(0.0, 0.0)],
             },
             Gesture::Moving {
                 from: Point::new(0.0, 0.0),

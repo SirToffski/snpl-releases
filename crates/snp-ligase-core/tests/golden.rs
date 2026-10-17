@@ -19,8 +19,8 @@ use image::{Rgba, RgbaImage};
 use snp_ligase_core::codec;
 use snp_ligase_core::geom::{Point, Rect};
 use snp_ligase_core::model::{
-    Annotation, BlurA, HighlightA, ImageA, Kind, PathA, PolygonA, RectA, Rgba as ModelRgba, Stroke,
-    defaults,
+    Annotation, BlurA, FreehandA, HighlightA, ImageA, Kind, PathA, PolygonA, RectA,
+    Rgba as ModelRgba, Stroke, defaults,
 };
 use snp_ligase_core::render;
 use snp_ligase_core::text::Fonts;
@@ -403,7 +403,9 @@ fn golden_expanded_export() {
 
 /// NEXT_STEPS step 11: two pasted images stitched onto the base, with a blur
 /// across the first one — the pasted pixels are what gets blurred, which is
-/// the key compositing decision of the step.
+/// the key compositing decision of the step. NEXT_STEPS step 12 adds a second
+/// blur wholly outside the original image, which needs the layer to reach the
+/// pasted screenshot beside it.
 #[test]
 fn golden_a_stitched_image() {
     /// A small stand-in for a pasted screenshot: red with white stripes.
@@ -457,6 +459,16 @@ fn golden_a_stitched_image() {
             radius: 8.0,
         }),
     });
+    // NEXT_STEPS step 12: a second blur, entirely outside the original image
+    // (which ends at x = 240) — the case that used to do nothing at all.
+    doc.annotations.push(Annotation {
+        id: 33,
+        shadow: false,
+        kind: Kind::Blur(BlurA {
+            rect: Rect::new(250.0, 24.0, 16.0, 30.0),
+            radius: 6.0,
+        }),
+    });
 
     let rendered = render::flatten_with(
         &doc,
@@ -467,6 +479,49 @@ fn golden_a_stitched_image() {
         },
     );
     check_golden("stitched", &rendered);
+}
+
+/// NEXT_STEPS step 14a: an opaque freehand scribble with a shadow, and a
+/// translucent marker that crosses itself — the crossing must stay uniform.
+#[test]
+fn golden_freehand_scribbles() {
+    let mut doc = snp_ligase_core::model::Document::new(scene_base(360, 280));
+    doc.annotations.push(Annotation {
+        id: 40,
+        shadow: true,
+        kind: Kind::Freehand(FreehandA {
+            points: vec![
+                Point::new(30.0, 200.0),
+                Point::new(65.0, 160.0),
+                Point::new(100.0, 215.0),
+                Point::new(135.0, 165.0),
+                Point::new(170.0, 205.0),
+            ],
+            stroke: Stroke {
+                color: defaults::STROKE_COLOR,
+                width: 4.0,
+            },
+        }),
+    });
+    doc.annotations.push(Annotation {
+        id: 41,
+        shadow: false,
+        kind: Kind::Freehand(FreehandA {
+            points: vec![
+                Point::new(190.0, 230.0),
+                Point::new(260.0, 170.0),
+                Point::new(200.0, 170.0),
+                Point::new(270.0, 230.0),
+            ],
+            stroke: Stroke {
+                color: [255, 255, 0, 128],
+                width: 16.0,
+            },
+        }),
+    });
+
+    let rendered = render::flatten(&doc, &mut Fonts::bundled());
+    check_golden("freehand", &rendered);
 }
 
 #[test]
