@@ -263,6 +263,71 @@ pub struct SnpLigaseApp {
     save_worker: crate::save::SaveWorker,
     /// The saves in flight, by tab id (H6).
     saving: std::collections::HashMap<u64, SaveInFlight>,
+    /// A new capture's clipboard copy that failed and is being retried (see
+    /// [`CaptureCopy`]).
+    capture_copy: Option<CaptureCopy>,
+    /// Why the last capture's clipboard copy finally failed, kept so the
+    /// auto-save's status line says so instead of replacing the warning.
+    capture_copy_failed: Option<String>,
+}
+
+/// Puts `image` on the OS clipboard (SPEC 6.3 and 7.4).
+fn set_clipboard_image(image: &image::RgbaImage) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut clipboard| {
+            clipboard.set_image(arboard::ImageData {
+                width: image.width() as usize,
+                height: image.height() as usize,
+                bytes: image.as_raw().clone().into(),
+            })
+        })
+        .map_err(|err| err.to_string())
+}
+
+/// How often a new capture's failed clipboard copy is tried again.
+const CAPTURE_COPY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long it is retried before the failure is reported.
+const CAPTURE_COPY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A new capture's clipboard copy that has not gone through yet.
+///
+/// On Windows another program often holds the clipboard for a moment: a
+/// clipboard-history or monitoring tool reading the previous copy, an Office
+/// app rendering a delayed format. `arboard` tries to open it for only ~27 ms,
+/// so a capture copy made at that moment failed, and its status line was then
+/// replaced ~70 ms later by the auto-save's "Auto-saved …" — the copy was lost
+/// without the user ever seeing why. The copy is now retried across frames,
+/// without blocking the UI, for [`CAPTURE_COPY_WINDOW`].
+struct CaptureCopy {
+    image: std::sync::Arc<image::RgbaImage>,
+    since: std::time::Instant,
+    last_try: std::time::Instant,
+    attempts: u32,
+    last_error: String,
+}
+
+/// What to do with a pending capture copy at `now`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyRetry {
+    /// Not yet: the last try was under [`CAPTURE_COPY_RETRY`] ago.
+    Wait,
+    /// Try again now.
+    Try,
+    /// The window is over: report the failure.
+    GiveUp,
+}
+
+impl CaptureCopy {
+    fn decide(&self, now: std::time::Instant) -> CopyRetry {
+        if now.saturating_duration_since(self.since) >= CAPTURE_COPY_WINDOW {
+            CopyRetry::GiveUp
+        } else if now.saturating_duration_since(self.last_try) >= CAPTURE_COPY_RETRY {
+            CopyRetry::Try
+        } else {
+            CopyRetry::Wait
+        }
+    }
 }
 
 impl SnpLigaseApp {
@@ -406,6 +471,8 @@ impl SnpLigaseApp {
             close_hides,
             save_worker,
             saving: std::collections::HashMap::new(),
+            capture_copy: None,
+            capture_copy_failed: None,
         }
     }
 
@@ -954,8 +1021,13 @@ impl SnpLigaseApp {
         for event in self.controller.take_events() {
             match event {
                 UiEvent::NewCapture(image) => {
-                    self.add_capture(image);
+                    // The clipboard first, the auto-save second: an AVIF
+                    // encode keeps the CPU busy for seconds, and a copy made
+                    // under that load (or read by other programs under it)
+                    // was the one that went missing.
+                    self.push_capture_tab(image);
                     self.copy_new_capture();
+                    self.auto_save_capture();
                 }
                 UiEvent::Status(message) | UiEvent::Warning(message) => self.report(message),
                 UiEvent::ShowSettings => self.run(Action::Settings),
@@ -981,11 +1053,20 @@ impl SnpLigaseApp {
                         tracing::warn!(path = %name, "a finished save's tab is gone");
                     }
                     let reported = if outcome.auto { "Auto-saved" } else { "Saved" };
-                    self.report(format!(
+                    let mut message = format!(
                         "{reported} {name} ({} bytes in {:.0} ms).",
                         stats.bytes,
                         stats.encode_ms + stats.write_ms
-                    ));
+                    );
+                    // The auto-save lands right after the capture's clipboard
+                    // copy; a copy that failed must not be hidden by it.
+                    if outcome.auto
+                        && let Some(failure) = &self.capture_copy_failed
+                    {
+                        message.push(' ');
+                        message.push_str(failure);
+                    }
+                    self.report(message);
                 }
                 Err(message) => {
                     tracing::warn!(path = %name, error = %message, "the save failed");
@@ -1064,22 +1145,71 @@ impl SnpLigaseApp {
             return;
         };
         let image = std::sync::Arc::clone(&tab.document.base);
-        let (width, height) = (image.width(), image.height());
-        let result = arboard::Clipboard::new().and_then(|mut clipboard| {
-            clipboard.set_image(arboard::ImageData {
-                width: width as usize,
-                height: height as usize,
-                bytes: image.as_raw().clone().into(),
-            })
-        });
-        match result {
+        // A newer capture replaces whatever an older one was still retrying.
+        self.capture_copy = None;
+        self.capture_copy_failed = None;
+        let now = std::time::Instant::now();
+        match set_clipboard_image(&image) {
             Ok(()) => tracing::info!(
                 target: "snp_ligase::ui",
-                width,
-                height,
+                width = image.width(),
+                height = image.height(),
                 "capture copied to the clipboard"
             ),
-            Err(err) => self.report(format!("Captured, but the clipboard copy failed: {err}")),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "the capture's clipboard copy failed; retrying"
+                );
+                self.capture_copy = Some(CaptureCopy {
+                    image,
+                    since: now,
+                    last_try: now,
+                    attempts: 1,
+                    last_error: err,
+                });
+            }
+        }
+    }
+
+    /// Tries a pending capture copy again (see [`CaptureCopy`]); called once
+    /// per frame, which the frame keeps asking for while one is pending.
+    fn retry_capture_copy(&mut self, now: std::time::Instant) {
+        let Some(pending) = self.capture_copy.as_mut() else {
+            return;
+        };
+        match pending.decide(now) {
+            CopyRetry::Wait => {}
+            CopyRetry::Try => {
+                pending.last_try = now;
+                pending.attempts += 1;
+                let image = std::sync::Arc::clone(&pending.image);
+                match set_clipboard_image(&image) {
+                    Ok(()) => {
+                        let attempts = pending.attempts;
+                        self.capture_copy = None;
+                        tracing::info!(
+                            target: "snp_ligase::ui",
+                            width = image.width(),
+                            height = image.height(),
+                            attempts,
+                            "capture copied to the clipboard"
+                        );
+                    }
+                    Err(err) => pending.last_error = err,
+                }
+            }
+            CopyRetry::GiveUp => {
+                let attempts = pending.attempts;
+                let message = format!(
+                    "The clipboard copy failed ({}); File > Copy (Ctrl+C) tries again.",
+                    pending.last_error
+                );
+                self.capture_copy = None;
+                tracing::warn!(attempts, "{message}");
+                self.report(format!("Captured, but: {message}"));
+                self.capture_copy_failed = Some(message);
+            }
         }
     }
 
@@ -1143,11 +1273,16 @@ impl SnpLigaseApp {
 
     /// Adds a tab holding `image`, titled by the clock (SPEC 6.3).
     ///
-    /// `UiEvent::NewCapture` is the only caller in the program: the controller
-    /// thread captures, the UI thread owns documents (SPEC 6.2). With SPEC
-    /// section 10's "auto-save new captures" on, the file is written straight
-    /// away as well.
+    /// Tests only: the program's one path is `UiEvent::NewCapture`, which puts
+    /// the clipboard copy between the tab and the auto-save.
+    #[cfg(test)]
     pub fn add_capture(&mut self, image: image::RgbaImage) {
+        self.push_capture_tab(image);
+        self.auto_save_capture();
+    }
+
+    /// The new capture's tab and its status line, without the auto-save.
+    fn push_capture_tab(&mut self, image: image::RgbaImage) {
         let (width, height) = (image.width(), image.height());
         let title = format!("Capture {}", clock_now());
         let tab = Tab::new(Document::new(image), title);
@@ -1155,7 +1290,6 @@ impl SnpLigaseApp {
         self.report(format!(
             "Captured {width} × {height} px. Save As to keep it."
         ));
-        self.auto_save_capture();
     }
 
     /// SPEC section 10's "Auto-save new captures": write the new capture into
@@ -1464,14 +1598,10 @@ impl SnpLigaseApp {
             return;
         };
         let (width, height) = (image.width(), image.height());
-        let result = arboard::Clipboard::new().and_then(|mut clipboard| {
-            clipboard.set_image(arboard::ImageData {
-                width: width as usize,
-                height: height as usize,
-                bytes: image.into_raw().into(),
-            })
-        });
-        match result {
+        // An explicit copy wins over a capture copy that is still retrying.
+        self.capture_copy = None;
+        self.capture_copy_failed = None;
+        match set_clipboard_image(&image) {
             Ok(()) => self.report(format!("Copied {width} × {height} px to the clipboard.")),
             Err(err) => self.report(format!("Could not copy to the clipboard: {err}")),
         }
@@ -2259,6 +2389,10 @@ impl SnpLigaseApp {
         // running — that is the whole point of it (SPEC 6.2) — so its queue is
         // drained before anything is drawn.
         self.drain_controller_events();
+        self.retry_capture_copy(std::time::Instant::now());
+        if self.capture_copy.is_some() {
+            ctx.request_repaint_after(CAPTURE_COPY_RETRY);
+        }
         self.drain_saves();
         self.poll_fonts();
         self.open_pending();
@@ -3411,6 +3545,21 @@ impl std::fmt::Debug for SnpLigaseApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_capture_copy_retry_policy() {
+        let now = std::time::Instant::now();
+        let copy = CaptureCopy {
+            image: std::sync::Arc::new(image::RgbaImage::new(1, 1)),
+            since: now,
+            last_try: now,
+            attempts: 1,
+            last_error: String::new(),
+        };
+        assert_eq!(copy.decide(now), CopyRetry::Wait);
+        assert_eq!(copy.decide(now + CAPTURE_COPY_RETRY), CopyRetry::Try);
+        assert_eq!(copy.decide(now + CAPTURE_COPY_WINDOW), CopyRetry::GiveUp);
+    }
     use image::RgbaImage;
     use snp_ligase_core::geom::Rect;
     use snp_ligase_core::model::defaults;

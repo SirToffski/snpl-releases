@@ -267,17 +267,32 @@ pub fn encode_jxl(image: &RgbaImage) -> crate::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// How many threads an AVIF encode may use: half the machine, at least one.
+///
+/// `image`'s encoder uses every core by default, and a 4K encode then
+/// saturates the whole machine for seconds — long enough to starve the other
+/// programs reading the capture off the clipboard, which is how a capture's
+/// clipboard copy went missing with AVIF auto-save on. The encode runs on the
+/// save worker, so a slower one costs nothing the user waits for.
+#[cfg(feature = "avif")]
+#[must_use]
+pub fn avif_threads(available: usize) -> usize {
+    (available / 2).max(1)
+}
+
 /// Encodes an image as AVIF (SPEC section 9: quality default 80, speed 6).
 #[cfg(feature = "avif")]
 pub fn encode_avif(image: &RgbaImage, options: &EncodeOptions) -> crate::Result<Vec<u8>> {
     use image::codecs::avif::AvifEncoder;
 
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let mut bytes = Vec::new();
     AvifEncoder::new_with_speed_quality(
         &mut bytes,
         options.avif_speed.clamp(1, 10),
         options.avif_quality.clamp(1, 100),
     )
+    .with_num_threads(Some(avif_threads(available)))
     .write_image(
         image.as_raw(),
         image.width(),
@@ -393,6 +408,17 @@ mod tests {
 
     fn encoded(image: &RgbaImage, format: Format) -> Vec<u8> {
         encode(image, format, &EncodeOptions::default()).expect("encodes")
+    }
+
+    /// An AVIF encode leaves half the machine to everything else.
+    #[cfg(feature = "avif")]
+    #[test]
+    fn avif_uses_half_the_cores_and_at_least_one() {
+        assert_eq!(avif_threads(16), 8);
+        assert_eq!(avif_threads(8), 4);
+        assert_eq!(avif_threads(3), 1);
+        assert_eq!(avif_threads(1), 1);
+        assert_eq!(avif_threads(0), 1);
     }
 
     #[test]
