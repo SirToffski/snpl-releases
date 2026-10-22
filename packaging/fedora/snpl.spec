@@ -51,9 +51,15 @@ text, highlights, blur and numbered steps. It runs on X11 and on Wayland
 (KDE Plasma natively; other desktops through the screenshot portal).
 
 %build
+# Fedora's rpmbuild exports its own RUSTFLAGS (opt-level, full debuginfo,
+# strip=none, frame pointers). They would override Cargo's release profile
+# (thin LTO, stripped) and ship a binary several times larger, so Cargo's
+# profile decides here, as it does for the Windows and Arch builds.
+unset RUSTFLAGS
 cargo build --release --locked -p snp-ligase-app
 
 %check
+unset RUSTFLAGS
 cargo test --workspace --locked
 
 %install
