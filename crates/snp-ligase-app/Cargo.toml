@@ -44,20 +44,35 @@ image = { workspace = true, default-features = false, features = ["png"] }
 snp-ligase-core.workspace = true
 # Clipboard: copy a flattened image, paste one in (SPEC section 9).
 arboard.workspace = true
-# Global hotkeys (SPEC 6.1) and the tray icon (SPEC 6.1), both behind the M5
-# controller thread. Their event handlers only send on a channel; the capture
-# pipeline runs there, not in the egui frame (SPEC 6.2).
+# Global hotkeys (SPEC 6.1), behind the M5 controller thread: its event handler
+# only sends on a channel; the capture pipeline runs there, not in the egui
+# frame (SPEC 6.2). The Linux X11 backend is real (LINUX_SUPPORT.md L1); the
+# Wayland portal one is L3.
 global-hotkey.workspace = true
-tray-icon.workspace = true
 # Capture tab titles (`Capture HH:MM:SS`) and the default save name
 # `snap_%Y%m%d-%H%M%S` (SPEC 7.1 and 9).
 chrono.workspace = true
 # Native file dialogs for Open and Save As (SPEC section 9).
 rfd.workspace = true
+
+# Windows-only dependencies (LINUX_SUPPORT.md section 3, item 1). A non-Windows
+# target must configure without them: no tray icon on Linux for now
+# (LINUX_SUPPORT.md section 1), and `tray-icon` builds against GTK there.
+[target.'cfg(windows)'.dependencies]
+# The tray icon and its menu (SPEC 6.1).
+tray-icon.workspace = true
 # Only used in the one clearly-marked `#[cfg(windows)]` spot that borrows the
 # console for `--debug-capture` (SPEC section 0, rule 7). Everything else that
 # touches Windows lives in snp-ligase-platform.
 windows = { workspace = true, features = ["Win32_System_Console"] }
+
+# Linux-only dependencies (LINUX_SUPPORT.md).
+[target.'cfg(target_os = "linux")'.dependencies]
+# LINUX_SUPPORT.md section 3, item 6: a KDE Wayland session has no X11
+# selection to copy into unless arboard speaks the compositor's data-control
+# protocol. Same crate and version as above, one extra feature. MIT/Apache-2.0,
+# like arboard itself; the crates it pulls in are recorded in `DECISIONS.md`.
+arboard = { workspace = true, features = ["wayland-data-control"] }
 
 [build-dependencies]
 embed-manifest.workspace = true

@@ -28,6 +28,12 @@ use crate::render::Canvas;
 pub const LINE_HEIGHT_SCALE: f32 = 1.2;
 
 /// The family SPEC 7.5 names as the default.
+///
+/// "Segoe UI" is Windows-only: on Linux [`Fonts::load`] takes the family the
+/// database resolves for `sans-serif` instead of this name
+/// (LINUX_SUPPORT.md section 3, item 5). The constant stays the Windows
+/// default, and the name the app's styles start from before the fonts have
+/// loaded.
 pub const DEFAULT_FAMILY: &str = "Segoe UI";
 
 /// The font system, owned once per application (SPEC 7.5).
@@ -62,10 +68,15 @@ impl Fonts {
     #[must_use]
     pub fn load() -> Self {
         let mut system = FontSystem::new();
-        // Make cosmic-text's own fallback family agree with SPEC 7.5's default,
-        // so a request for a family nobody installed lands on Segoe UI.
-        system.db_mut().set_sans_serif_family(DEFAULT_FAMILY);
-        Self::new(system, DEFAULT_FAMILY)
+        // SPEC 7.5 asks for "Segoe UI"; that name exists on Windows only, so
+        // elsewhere the default is the family the database resolves for
+        // `sans-serif` — fontconfig's choice (LINUX_SUPPORT.md section 3,
+        // item 5). Setting it back as cosmic-text's generic sans-serif keeps
+        // the default and the fallback for a missing family (SPEC 4.2) the
+        // same family.
+        let default = system_default_family(&system);
+        system.db_mut().set_sans_serif_family(&default);
+        Self::new(system, &default)
     }
 
     /// The bundled test font only: Inter Regular (OFL-1.1, in
@@ -160,6 +171,78 @@ impl Fonts {
         }
         self.fallback.clone()
     }
+}
+
+/// The default family for this OS (LINUX_SUPPORT.md section 3, item 5).
+///
+/// Windows keeps SPEC 7.5's "Segoe UI". Everywhere else the name is taken from
+/// the loaded database's `sans-serif` resolution — on Linux that is fontconfig's
+/// choice, so the default is a family that is really installed.
+fn system_default_family(system: &FontSystem) -> String {
+    #[cfg(windows)]
+    {
+        let _ = system;
+        DEFAULT_FAMILY.to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        let preferred = system
+            .db()
+            .family_name(&fontdb::Family::SansSerif)
+            .to_owned();
+        let installed: BTreeSet<String> = system
+            .db()
+            .faces()
+            .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+            .collect();
+        let family = installed_default_family(&preferred, &installed);
+        if family != preferred {
+            tracing::info!(
+                preferred = %preferred,
+                chosen = %family,
+                "the sans-serif family is not installed; using an installed one"
+            );
+        }
+        family
+    }
+}
+
+/// The default family: `preferred` (the database's `sans-serif` name) when it
+/// is installed, otherwise an installed family that looks like a text sans.
+///
+/// The database's `sans-serif` is a *name*, not a lookup: cosmic-text sets one
+/// whether or not that font exists, and a machine without it (a minimal Arch
+/// install with only Adwaita fonts) got "Open Sans" as the default for every
+/// new text annotation. The pick prefers a family named "Sans" that is not a
+/// mono, emoji or symbol face, then any such family, then any family at all.
+#[cfg_attr(windows, allow(dead_code))]
+fn installed_default_family(preferred: &str, installed: &BTreeSet<String>) -> String {
+    if installed
+        .iter()
+        .any(|family| family.eq_ignore_ascii_case(preferred))
+    {
+        return preferred.to_owned();
+    }
+    let text_face = |family: &&String| {
+        let lower = family.to_ascii_lowercase();
+        !["mono", "emoji", "symbol", "math", "icon"]
+            .iter()
+            .any(|word| lower.contains(word))
+    };
+    installed
+        .iter()
+        .filter(text_face)
+        .find(|family| family.to_ascii_lowercase().contains("sans"))
+        .or_else(|| installed.iter().find(text_face))
+        .or_else(|| installed.iter().next())
+        .cloned()
+        .unwrap_or_else(|| {
+            if preferred.is_empty() {
+                DEFAULT_FAMILY.to_owned()
+            } else {
+                preferred.to_owned()
+            }
+        })
 }
 
 /// What a laid-out run of text measures, without any padding (SPEC 4.2).
@@ -413,6 +496,81 @@ mod tests {
         let fonts = fonts();
         assert_eq!(fonts.families(), ["Inter"], "the test font is not alone");
         assert_eq!(fonts.fallback_family(), "Inter");
+    }
+
+    /// The default must be a family that is really installed: cosmic-text
+    /// names a `sans-serif` whether or not it exists (found on an Arch WSL
+    /// install with only the Adwaita fonts, where it named "Open Sans").
+    #[test]
+    fn the_default_family_is_always_an_installed_one() {
+        let set = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+
+        // Installed: kept as is, whatever its case.
+        assert_eq!(
+            installed_default_family("DejaVu Sans", &set(&["DejaVu Sans", "Noto Sans"])),
+            "DejaVu Sans"
+        );
+        assert_eq!(
+            installed_default_family("dejavu sans", &set(&["DejaVu Sans"])),
+            "dejavu sans"
+        );
+        // Not installed: an installed text sans, never the mono one.
+        assert_eq!(
+            installed_default_family("Open Sans", &set(&["Adwaita Mono", "Adwaita Sans"])),
+            "Adwaita Sans"
+        );
+        assert_eq!(
+            installed_default_family(
+                "Open Sans",
+                &set(&["Noto Color Emoji", "Noto Sans Mono", "Liberation Serif"])
+            ),
+            "Liberation Serif",
+            "no sans at all: the first text family"
+        );
+        assert_eq!(
+            installed_default_family("Open Sans", &set(&["Noto Sans Mono"])),
+            "Noto Sans Mono",
+            "only a mono face: still an installed family"
+        );
+        // Nothing installed (still loading): the name stays, nothing to pick.
+        assert_eq!(
+            installed_default_family("Open Sans", &set(&[])),
+            "Open Sans"
+        );
+        assert_eq!(installed_default_family("", &set(&[])), DEFAULT_FAMILY);
+    }
+
+    /// LINUX_SUPPORT.md section 3, item 5: "Segoe UI" is Windows-only, so on
+    /// Linux the default family comes from the font database (fontconfig's
+    /// choice for `sans-serif`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_default_font_is_the_system_sans_serif() {
+        let fonts = Fonts::load();
+
+        assert_ne!(
+            fonts.fallback_family(),
+            DEFAULT_FAMILY,
+            "the Linux default is still the Windows-only name"
+        );
+        assert!(
+            fonts
+                .families()
+                .iter()
+                .any(|family| family == fonts.fallback_family()),
+            "the default {} is not an installed family: {:?}",
+            fonts.fallback_family(),
+            fonts.families()
+        );
+    }
+
+    /// The Windows half of the same rule (SPEC 7.5): unchanged.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_default_font_is_spec_7_5s_name() {
+        assert_eq!(Fonts::load().fallback_family(), DEFAULT_FAMILY);
     }
 
     #[test]

@@ -430,6 +430,10 @@ fn frame_from_pixels(info: &MonitorInfo, pixels: MonitorPixels, started: Instant
         info: info.clone(),
         image,
         diagnostics,
+        // Windows frames hold their own pixels: 1 frame px = 1 virtual px.
+        stored_pixels: crate::StoredPixels::Virtual,
+        native_scale_x: 1.0,
+        native_scale_y: 1.0,
     }
 }
 
@@ -589,6 +593,10 @@ fn gdi_frame(raw: &[RawMonitor], info: &MonitorInfo, started: Instant) -> Result
         info: info.clone(),
         image,
         diagnostics,
+        // Windows frames hold their own pixels: 1 frame px = 1 virtual px.
+        stored_pixels: crate::StoredPixels::Virtual,
+        native_scale_x: 1.0,
+        native_scale_y: 1.0,
     })
 }
 

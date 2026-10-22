@@ -13,8 +13,10 @@ use egui::{CentralPanel, Key, Panel, Ui, pos2};
 use snp_ligase_core::codec;
 use snp_ligase_core::geom::{Point, Rect};
 use snp_ligase_core::model::{Document, Kind, Rgba};
+use snp_ligase_platform::Capabilities;
 
 use crate::canvas::{self, CanvasInput};
+use crate::clipboard::ClipboardHandle;
 use crate::controller::{AppCommand, CaptureSettings, Controller, UiEvent};
 use crate::hotkeys::{Hotkeys, Recorded, RecorderInput};
 use crate::panels::{self, properties};
@@ -46,6 +48,9 @@ pub struct Shell {
     /// SPEC 10's "Start hidden in the tray": hide the window on the second
     /// frame (see [`SnpLigaseApp::start_hidden`]).
     pub start_hidden: bool,
+    /// What the platform backend can really do (LINUX_SUPPORT.md section 3,
+    /// item 2): the menus and the Settings dialog disable what is missing.
+    pub capabilities: Capabilities,
 }
 
 /// Whether the app should start with its window hidden (SPEC 10's "Start hidden
@@ -98,6 +103,84 @@ enum PendingClose {
         indices: Vec<usize>,
         then_exit: bool,
     },
+    /// "Quit snp-ligase?" (LINUX_SUPPORT.md section 3, item 8): on a platform
+    /// with no tray icon the window's X is the only way out, so the last
+    /// question before leaving is a confirmation.
+    Quit,
+}
+
+/// What one close request does (SPEC 6.1, G3; LINUX_SUPPORT.md section 3,
+/// item 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseChoice {
+    /// Hide to the tray (Windows with an installed tray; SPEC 6.1's default).
+    Hide,
+    /// The user can see the window leave, so ask first.
+    AskQuit,
+    /// Just leave.
+    Exit,
+}
+
+/// The decision for one close request, as a pure function so the table can be
+/// tested without a window (NEXT_STEPS section 1).
+///
+/// `close_hides` is the app's live state (tray installed *and* the setting on);
+/// `platform_tray` is [`Capabilities::tray`], the platform's own answer.
+///
+/// The confirmation needs the **platform** to have no tray at all, not just a
+/// failed install: on Windows a tray that could not be created keeps G3's old
+/// behaviour (the X exits without a question) and nothing about Windows
+/// changes (LINUX_SUPPORT.md section 3, item 8).
+#[must_use]
+fn close_choice(close_hides: bool, platform_tray: bool, ask_before_quitting: bool) -> CloseChoice {
+    if close_hides {
+        CloseChoice::Hide
+    } else if quit_asks_first(platform_tray, ask_before_quitting) {
+        CloseChoice::AskQuit
+    } else {
+        CloseChoice::Exit
+    }
+}
+
+/// Whether leaving has to ask "Quit snp-ligase?" first (LINUX_SUPPORT.md
+/// section 3, item 8).
+///
+/// Only where the platform has no tray icon at all: the window's X is then the
+/// user's one door out of the process, and closing it by accident would end
+/// their work. This is about the platform, not a tray that failed to install,
+/// so Windows keeps the behaviour G3 describes.
+#[must_use]
+fn quit_asks_first(platform_tray: bool, ask_before_quitting: bool) -> bool {
+    !platform_tray && ask_before_quitting
+}
+
+/// What a Settings > OK should do to the login entry: `Some(true)` to add it,
+/// `Some(false)` to remove it, `None` when the setting did not change.
+#[must_use]
+fn autostart_change(before: bool, after: bool) -> Option<bool> {
+    (before != after).then_some(after)
+}
+
+/// Adds or removes the login entry for this exe (SPEC 10, "Start with
+/// Windows").
+#[cfg(windows)]
+fn apply_autostart(on: bool) -> Result<(), String> {
+    use snp_ligase_platform::windows::autostart;
+    let result = if on {
+        std::env::current_exe()
+            .map_err(|err| format!("Could not find this program's path: {err}"))
+            .and_then(|exe| autostart::enable(&exe).map_err(|err| err.to_string()))
+    } else {
+        autostart::disable().map_err(|err| err.to_string())
+    };
+    result.map_err(|message| format!("Start with Windows was not changed: {message}"))
+}
+
+/// There is no login entry to change on this platform yet; the Settings row is
+/// disabled, so this is reached only by a hand-edited config.
+#[cfg(not(windows))]
+fn apply_autostart(_on: bool) -> Result<(), String> {
+    Err("Starting at login is not built on this platform yet.".to_owned())
 }
 
 /// A save the save worker is still running (H6).
@@ -158,6 +241,10 @@ pub struct SnpLigaseApp {
     status: String,
     log_dir: PathBuf,
     pending_close: Option<PendingClose>,
+    /// The "Don't ask again" tick of the "Quit snp-ligase?" prompt: true means
+    /// the user still wants to be asked (the box starts unticked and is reset
+    /// every time the prompt opens). LINUX_SUPPORT.md section 3, item 8.
+    quit_asks_again: bool,
     /// Files named on the command line, opened once the window is up.
     pending_open: Vec<PathBuf>,
     /// The canvas size from the last frame, so zoom can centre on it.
@@ -222,6 +309,10 @@ pub struct SnpLigaseApp {
     /// Whether the tray icon really exists (G3): without it the X exits, and
     /// the setting cannot change that.
     tray_installed: bool,
+    /// What the platform backend can really do here (LINUX_SUPPORT.md section
+    /// 3, item 2), copied from the shell: `menu_state` and the Settings dialog
+    /// read it so a control that cannot work is disabled with a reason.
+    capabilities: Capabilities,
     /// The Settings dialog's working copy, while it is open. OK replaces the
     /// store with it; Cancel drops it.
     settings_draft: Option<Settings>,
@@ -263,6 +354,13 @@ pub struct SnpLigaseApp {
     save_worker: crate::save::SaveWorker,
     /// The saves in flight, by tab id (H6).
     saving: std::collections::HashMap<u64, SaveInFlight>,
+    /// Capture id → stable tab id and the unedited snapshot sent to the encoder.
+    capture_saves: std::collections::HashMap<u64, (u64, Document)>,
+    /// The one clipboard the app keeps for its whole life (LINUX_SUPPORT.md
+    /// section 3, item 6). On Linux the copying process serves the paste, so a
+    /// fresh `arboard::Clipboard` per operation — what this used to open —
+    /// loses the copy the moment it is made.
+    clipboard: ClipboardHandle,
     /// A new capture's clipboard copy that failed and is being retried (see
     /// [`CaptureCopy`]).
     capture_copy: Option<CaptureCopy>,
@@ -271,30 +369,17 @@ pub struct SnpLigaseApp {
     capture_copy_failed: Option<String>,
 }
 
-/// Puts `image` on the OS clipboard (SPEC 6.3 and 7.4).
-fn set_clipboard_image(image: &image::RgbaImage) -> Result<(), String> {
-    arboard::Clipboard::new()
-        .and_then(|mut clipboard| {
-            clipboard.set_image(arboard::ImageData {
-                width: image.width() as usize,
-                height: image.height() as usize,
-                bytes: image.as_raw().clone().into(),
-            })
-        })
-        .map_err(|err| err.to_string())
-}
-
 /// How often a new capture's failed clipboard copy is tried again.
-const CAPTURE_COPY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+pub(crate) const CAPTURE_COPY_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How long it is retried before the failure is reported.
-const CAPTURE_COPY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const CAPTURE_COPY_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// A new capture's clipboard copy that has not gone through yet.
 ///
 /// On Windows another program often holds the clipboard for a moment: a
 /// clipboard-history or monitoring tool reading the previous copy, an Office
-/// app rendering a delayed format. `arboard` tries to open it for only ~27 ms,
+/// app rendering a delayed format. `arboard` tries to open it for only ~25 ms,
 /// so a capture copy made at that moment failed, and its status line was then
 /// replaced ~70 ms later by the auto-save's "Auto-saved …" — the copy was lost
 /// without the user ever seeing why. The copy is now retried across frames,
@@ -355,6 +440,7 @@ impl SnpLigaseApp {
             warnings: Vec::new(),
             tray_installed: true,
             start_hidden: false,
+            capabilities: Capabilities::FULL,
         })
     }
 
@@ -370,11 +456,13 @@ impl SnpLigaseApp {
             warnings,
             tray_installed,
             start_hidden,
+            capabilities,
         } = shell;
 
         // H6: the encodes run off this thread. The window gate is how the
         // worker asks for the frame that applies the result, even when the
         // window is hidden and egui would not run one by itself.
+        let clipboard = controller.window().clipboard.clone();
         let save_worker = crate::save::SaveWorker::spawn(controller.window_handle());
 
         // SPEC 7.5: the font system is loaded once, on a background thread, and
@@ -436,6 +524,7 @@ impl SnpLigaseApp {
             status,
             log_dir,
             pending_close: None,
+            quit_asks_again: true,
             pending_open: files,
             canvas: egui::vec2(800.0, 600.0),
             content_rect: Rect::ZERO,
@@ -458,6 +547,7 @@ impl SnpLigaseApp {
             settings_warnings: Vec::new(),
             settings,
             tray_installed,
+            capabilities,
             settings_draft: None,
             shortcuts_open: false,
             start_hidden,
@@ -471,6 +561,8 @@ impl SnpLigaseApp {
             close_hides,
             save_worker,
             saving: std::collections::HashMap::new(),
+            capture_saves: std::collections::HashMap::new(),
+            clipboard,
             capture_copy: None,
             capture_copy_failed: None,
         }
@@ -487,6 +579,16 @@ impl SnpLigaseApp {
         };
         match receiver.try_recv() {
             Ok(fonts) => {
+                // LINUX_SUPPORT.md L0c item 5: the default family is the one
+                // the loaded database reports for this platform, so the styles
+                // a fresh install starts from follow it. On Windows that name
+                // is SPEC 7.5's "Segoe UI" and nothing changes.
+                if self.styles.adopt_default_family(fonts.fallback_family()) {
+                    tracing::info!(
+                        family = %fonts.fallback_family(),
+                        "the default font family follows the system"
+                    );
+                }
                 self.fonts = fonts;
                 self.fonts_loading = None;
                 for tab in &mut self.tabs {
@@ -774,11 +876,23 @@ impl SnpLigaseApp {
     /// has to be reported; the rest applies regardless (SPEC section 10's
     /// conflict warnings).
     fn apply_settings(&mut self) {
-        let Some(draft) = self.settings_draft.take() else {
+        let Some(mut draft) = self.settings_draft.take() else {
             return;
         };
         self.settings_warnings.clear();
         let mut warnings = Vec::new();
+
+        // "Start with Windows" (SPEC 10): the login entry changes only here,
+        // when the user changes the setting. If the registry refuses, the
+        // setting keeps its old value so the file never claims what is not so.
+        if let Some(on) = autostart_change(
+            self.settings.settings().start_with_windows,
+            draft.start_with_windows,
+        ) && let Err(message) = apply_autostart(on)
+        {
+            warnings.push(message);
+            draft.start_with_windows = !on;
+        }
 
         let (bindings, hotkey_warnings) = crate::hotkeys::bindings_from(&draft);
         warnings.extend(hotkey_warnings);
@@ -788,7 +902,9 @@ impl SnpLigaseApp {
                 .rebind(self.controller.command_sender(), bindings),
         );
 
+        self.controller.window().set_auto_save(draft.clone());
         self.controller.send(AppCommand::Configure(CaptureSettings {
+            copy_new_captures: draft.copy_new_captures,
             hide_while_capturing: draft.hide_while_capturing,
             include_cursor: draft.include_cursor,
             hdr_highlights: draft.hdr_highlights,
@@ -854,7 +970,7 @@ impl SnpLigaseApp {
         self.hotkeys.borrow_mut().suspend();
         // A key held right now (someone clicking "Record…" with a key down)
         // must not end the recording until it is released and pressed again.
-        let already_down = snp_ligase_platform::windows::keys::keyboard_snapshot().keys;
+        let already_down = snp_ligase_platform::keys::keyboard_snapshot().keys;
         self.recording = Some(HotkeyRecording {
             mode,
             recorder: crate::hotkeys::Recorder::new(already_down),
@@ -884,10 +1000,7 @@ impl SnpLigaseApp {
     /// Called once per frame while recording. When the recording finishes, the
     /// guard goes first (re-registering the stored keys) and then the outcome
     /// is written into the dialog's draft.
-    fn poll_hotkey_recording(
-        &mut self,
-        snapshot: &snp_ligase_platform::windows::keys::KeyboardSnapshot,
-    ) {
+    fn poll_hotkey_recording(&mut self, snapshot: &snp_ligase_platform::keys::KeyboardSnapshot) {
         let Some(recording) = self.recording.as_mut() else {
             return;
         };
@@ -987,9 +1100,12 @@ impl SnpLigaseApp {
         panels::settings::show(
             ui,
             &mut draft,
-            &config_path,
-            recording,
-            &self.settings_warnings,
+            panels::settings::SettingsContext {
+                config_path: &config_path,
+                recording,
+                capabilities: &self.capabilities,
+                warnings: &self.settings_warnings,
+            },
             &mut self.recent_colours,
             actions,
         );
@@ -1004,7 +1120,8 @@ impl SnpLigaseApp {
         if !self.shortcuts_open {
             return;
         }
-        let rows = shortcuts::help_rows(self.settings.settings());
+        let rows =
+            shortcuts::help_rows_for(self.settings.settings(), self.capabilities.global_hotkeys);
         panels::shortcuts::window(ui, &rows, &mut self.shortcuts_open);
     }
 
@@ -1029,9 +1146,52 @@ impl SnpLigaseApp {
                     self.copy_new_capture();
                     self.auto_save_capture();
                 }
+                UiEvent::NewCaptureSaved {
+                    image,
+                    copy,
+                    id,
+                    saving,
+                } => {
+                    self.push_capture_tab(image);
+                    self.capture_copy = None;
+                    self.capture_copy_failed = copy.err().map(|error| {
+                        format!("Clipboard copy failed: {error}. File > Copy (Ctrl+C) tries again.")
+                    });
+                    if let Some(message) = self.capture_copy_failed.clone() {
+                        self.report(message);
+                    }
+                    if saving && let Some(tab) = self.tabs.get(self.active) {
+                        self.capture_saves
+                            .insert(id, (tab.id(), tab.document.clone()));
+                        self.saving
+                            .insert(tab.id(), PathBuf::from("Capture auto-save"));
+                    }
+                }
+                UiEvent::CaptureSaved { id, result } => {
+                    if let Some((tab_id, document)) = self.capture_saves.remove(&id) {
+                        self.saving.remove(&tab_id);
+                        match result {
+                            Ok(path) => {
+                                let message = format!("Auto-saved {}.", path.display());
+                                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id() == tab_id) {
+                                    tab.note_saved(path, document);
+                                }
+                                self.report(match &self.capture_copy_failed {
+                                    Some(failure) => format!("{message} {failure}"),
+                                    None => message,
+                                });
+                            }
+                            Err(error) => self.report(format!("Auto-save failed: {error}")),
+                        }
+                    }
+                }
                 UiEvent::Status(message) | UiEvent::Warning(message) => self.report(message),
                 UiEvent::ShowSettings => self.run(Action::Settings),
                 UiEvent::QuitRequested => self.quit_requested(),
+                // Another launch forwarded file names to this instance
+                // (LINUX_SUPPORT.md section 3, item 9). They open exactly like
+                // files named on the command line, this same frame.
+                UiEvent::OpenFiles(files) => self.pending_open.extend(files),
             }
         }
     }
@@ -1092,6 +1252,7 @@ impl SnpLigaseApp {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while self.saving.contains_key(&tab_id) && std::time::Instant::now() < deadline {
             self.drain_saves();
+            self.drain_controller_events();
             if self.saving.contains_key(&tab_id) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -1149,7 +1310,7 @@ impl SnpLigaseApp {
         self.capture_copy = None;
         self.capture_copy_failed = None;
         let now = std::time::Instant::now();
-        match set_clipboard_image(&image) {
+        match self.clipboard.copy_image(&image) {
             Ok(()) => tracing::info!(
                 target: "snp_ligase::ui",
                 width = image.width(),
@@ -1184,7 +1345,7 @@ impl SnpLigaseApp {
                 pending.last_try = now;
                 pending.attempts += 1;
                 let image = std::sync::Arc::clone(&pending.image);
-                match set_clipboard_image(&image) {
+                match self.clipboard.copy_image(&image) {
                     Ok(()) => {
                         let attempts = pending.attempts;
                         self.capture_copy = None;
@@ -1271,10 +1432,11 @@ impl SnpLigaseApp {
         self.active_point = None;
     }
 
-    /// Adds a tab holding `image`, titled by the clock (SPEC 6.3).
+    /// Adds a tab holding `image`, titled by the clock (SPEC 6.3), and
+    /// auto-saves it when SPEC section 10's "auto-save new captures" is on.
     ///
     /// Tests only: the program's one path is `UiEvent::NewCapture`, which puts
-    /// the clipboard copy between the tab and the auto-save.
+    /// the clipboard copy between the two steps.
     #[cfg(test)]
     pub fn add_capture(&mut self, image: image::RgbaImage) {
         self.push_capture_tab(image);
@@ -1341,33 +1503,10 @@ impl SnpLigaseApp {
 
     /// Adds an image pasted from the clipboard as a new tab (SPEC 7.1).
     fn action_paste(&mut self) {
-        match Self::clipboard_image() {
+        match self.clipboard.image() {
             Ok(image) => self.add_pasted(image),
             Err(message) => self.report(message),
         }
-    }
-
-    /// The clipboard's image, with the all-zero-alpha fix for 32-bit DIBs.
-    ///
-    /// Shared by both paste actions: Ctrl+V (a new tab) and Ctrl+Shift+V (into
-    /// the current tab, NEXT_STEPS step 11).
-    fn clipboard_image() -> Result<image::RgbaImage, String> {
-        let mut clipboard = arboard::Clipboard::new()
-            .map_err(|err| format!("Could not reach the clipboard: {err}"))?;
-        let image = clipboard
-            .get_image()
-            .map_err(|err| format!("The clipboard holds no image ({err})."))?;
-        let (width, height) = (image.width, image.height);
-        // 32-bit DIBs from other applications often carry an all-zero alpha
-        // channel, which would make the whole picture transparent.
-        let mut bytes = image.bytes.into_owned();
-        if !bytes.is_empty() && bytes.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0) {
-            for pixel in bytes.as_chunks_mut::<4>().0 {
-                pixel[3] = 255;
-            }
-        }
-        image::RgbaImage::from_raw(width as u32, height as u32, bytes)
-            .ok_or_else(|| "The clipboard image could not be read.".to_owned())
     }
 
     /// File > "Paste Image into This Tab" / Ctrl+Shift+V (NEXT_STEPS step 11):
@@ -1386,7 +1525,7 @@ impl SnpLigaseApp {
             }
             return;
         }
-        match Self::clipboard_image() {
+        match self.clipboard.image() {
             Ok(image) => self.paste_image_into_tab(image),
             Err(message) => self.report(message),
         }
@@ -1558,6 +1697,16 @@ impl SnpLigaseApp {
             options: self.settings.settings().encode_options(),
             auto,
         };
+        let mut claims = self
+            .controller
+            .window()
+            .save_claims
+            .lock()
+            .map_err(|e| e.to_string())?;
+        if !claims.insert(job.path.clone()) {
+            return Err(format!("{} is already being saved…", path.display()));
+        }
+        drop(claims);
         self.saving.insert(job.tab, job.path.clone());
         self.save_worker.submit(job);
         Ok(())
@@ -1569,9 +1718,12 @@ impl SnpLigaseApp {
     /// the filesystem alone cannot answer this.
     fn free_save_path(&self, folder: &Path, name: &str, extension: &str) -> PathBuf {
         let in_flight = &self.saving;
+        let claims = self.controller.window().save_claims.lock().ok();
         let file_name = free_file_name_with(name, extension, |candidate| {
             let path = folder.join(candidate);
-            path.exists() || in_flight.values().any(|claimed| *claimed == path)
+            path.exists()
+                || in_flight.values().any(|claimed| *claimed == path)
+                || claims.as_ref().is_some_and(|claims| claims.contains(&path))
         });
         folder.join(file_name)
     }
@@ -1601,7 +1753,7 @@ impl SnpLigaseApp {
         // An explicit copy wins over a capture copy that is still retrying.
         self.capture_copy = None;
         self.capture_copy_failed = None;
-        match set_clipboard_image(&image) {
+        match self.clipboard.copy_image(&image) {
             Ok(()) => self.report(format!("Copied {width} × {height} px to the clipboard.")),
             Err(err) => self.report(format!("Could not copy to the clipboard: {err}")),
         }
@@ -1650,7 +1802,9 @@ impl SnpLigaseApp {
         self.close_tabs(&(0..self.tabs.len()).collect::<Vec<_>>());
     }
 
-    /// Really exits, but only after asking about unsaved tabs (SPEC 6.1).
+    /// Really exits, but only after asking about unsaved tabs (SPEC 6.1) and
+    /// about leaving at all, where the X is the only way out (LINUX_SUPPORT.md
+    /// section 3, item 8).
     ///
     /// Both the window's close button and File > Exit come through here, so
     /// there is one place that decides what "leaving" means. SPEC section 10's
@@ -1666,13 +1820,51 @@ impl SnpLigaseApp {
             .filter(|&index| self.tabs[index].dirty())
             .collect();
         if dirty.is_empty() || !ask {
-            self.exit = true;
+            self.confirm_exit();
             return;
         }
         self.pending_close = Some(PendingClose::Tabs {
             indices: dirty,
             then_exit: true,
         });
+    }
+
+    /// The last step before leaving: ask "Quit snp-ligase?" where nothing can
+    /// bring the window back, then set `exit`, which the frame turns into
+    /// `ViewportCommand::Close` (G1).
+    ///
+    /// The unsaved-changes prompt runs first: this is reached only once there
+    /// is nothing left to ask about (LINUX_SUPPORT.md section 3, item 8).
+    fn confirm_exit(&mut self) {
+        if quit_asks_first(
+            self.capabilities.tray,
+            self.settings.settings().ask_before_quitting,
+        ) {
+            self.quit_asks_again = true;
+            self.pending_close = Some(PendingClose::Quit);
+            tracing::info!("this platform has no tray icon; asking before quitting");
+            return;
+        }
+        self.exit = true;
+    }
+
+    /// The answer to "Quit snp-ligase?" (LINUX_SUPPORT.md section 3, item 8).
+    ///
+    /// "Don't ask again" writes the setting straight into the live settings;
+    /// the debounced write lands in the file, and `on_exit` flushes it if the
+    /// exit beats the debounce.
+    fn confirm_quit(&mut self) {
+        if self.pending_close.as_ref() != Some(&PendingClose::Quit) {
+            return;
+        }
+        self.pending_close = None;
+        if !self.quit_asks_again {
+            let mut settings = self.settings.settings().clone();
+            settings.ask_before_quitting = false;
+            tracing::info!("\"Don't ask again\" was ticked; the quit confirmation is off");
+            self.settings.replace(settings);
+        }
+        self.exit = true;
     }
 
     /// Carries out a close the user confirmed.
@@ -1745,7 +1937,10 @@ impl SnpLigaseApp {
         self.close_tabs(&targets);
         self.report(format!("Closed {closed} tab(s)."));
         if then_exit {
-            self.exit = true;
+            // The tab question is answered; leaving still has to go through the
+            // last step, which is the quit confirmation where the platform has
+            // no tray icon (LINUX_SUPPORT.md section 3, item 8).
+            self.request_exit();
         }
     }
 
@@ -2034,7 +2229,7 @@ impl SnpLigaseApp {
             }
             Action::OpenLogFolder => self.open_log_folder(),
             Action::About => self.report(format!(
-                "snp-ligase {} — a Windows 11 screenshot and annotation tool.",
+                "snp-ligase {} — a screenshot and annotation tool.",
                 env!("CARGO_PKG_VERSION")
             )),
 
@@ -2087,6 +2282,11 @@ impl SnpLigaseApp {
             Action::ConfirmCancel => {
                 self.pending_close = None;
                 self.report("Cancelled; nothing was closed.");
+            }
+            Action::ConfirmQuit => self.confirm_quit(),
+            Action::CancelQuit => {
+                self.pending_close = None;
+                self.report("Cancelled; the app stays open.");
             }
 
             Action::PickColour(field) => {
@@ -2318,16 +2518,30 @@ impl SnpLigaseApp {
 }
 
 impl App for SnpLigaseApp {
+    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // eframe skips `ui` while minimized. Captures and attention/activation
+        // still need to finish, so Wayland handles them in the hidden tick.
+        #[cfg(target_os = "linux")]
+        if self.controller.window().is_wayland() {
+            self.controller.window().attach_surface(_frame);
+            self.drain_controller_events();
+        }
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.frame_ui(ui);
     }
 
     fn on_exit(&mut self) {
+        self.drain_controller_events();
+        #[cfg(target_os = "linux")]
+        self.controller.window().detach_surface();
         // H6: a save that is still running is nearly done — wait for it
         // (bounded), because exiting now would throw the file away.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while !self.saving.is_empty() && std::time::Instant::now() < deadline {
             self.drain_saves();
+            self.drain_controller_events();
             if !self.saving.is_empty() {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -2361,6 +2575,9 @@ impl SnpLigaseApp {
     /// One frame of the whole window.
     fn frame_ui(&mut self, ui: &mut Ui) {
         let ctx = ui.ctx().clone();
+        self.controller
+            .window()
+            .record_focus(ctx.input(|i| i.viewport().focused.unwrap_or(false)));
         let now = std::time::Instant::now();
         // H4: a move that is under way this frame is what lets the sprite cache
         // reuse translated pixels; whether it ended is checked at the bottom.
@@ -2408,7 +2625,7 @@ impl SnpLigaseApp {
         // itself and nothing else would run a frame.
         if self.recording.is_some() {
             if ctx.input(|input| input.viewport().focused.unwrap_or(true)) {
-                let snapshot = snp_ligase_platform::windows::keys::keyboard_snapshot();
+                let snapshot = snp_ligase_platform::keys::keyboard_snapshot();
                 self.poll_hotkey_recording(&snapshot);
                 ctx.request_repaint();
             } else {
@@ -2498,6 +2715,11 @@ impl SnpLigaseApp {
                 _ => (format!("{} images", indices.len()), true),
             };
             panels::unsaved_prompt(ui, &title, plural, &mut actions);
+        }
+        // "Quit snp-ligase?" (LINUX_SUPPORT.md section 3, item 8): the last
+        // question before the window closes on a platform with no tray icon.
+        if self.pending_close.as_ref() == Some(&PendingClose::Quit) {
+            panels::quit_prompt(ui, &mut self.quit_asks_again, &mut actions);
         }
 
         self.colour_window(ui, &mut actions);
@@ -2631,14 +2853,19 @@ impl SnpLigaseApp {
             // A save prompt is already up: this request is not a new decision.
             return;
         }
-        if self.close_hides {
+        match close_choice(
+            self.close_hides,
+            self.capabilities.tray,
+            self.settings.settings().ask_before_quitting,
+        ) {
             // SPEC 6.1: the X hides to the tray by default. File > Exit and the
             // tray's Quit really leave, and both ask about unsaved tabs first.
-            self.hide_to_tray();
-        } else {
+            CloseChoice::Hide => self.hide_to_tray(),
             // G3: without a tray icon there is no way back from a hidden
-            // window, so the X exits.
-            self.request_exit();
+            // window, so the X exits — leaving through `request_exit`, which
+            // asks about unsaved tabs and, where the platform has no tray at
+            // all, "Quit snp-ligase?" (LINUX_SUPPORT.md section 3, item 8).
+            CloseChoice::AskQuit | CloseChoice::Exit => self.request_exit(),
         }
     }
 
@@ -2673,10 +2900,8 @@ impl SnpLigaseApp {
         let settings = self.settings.settings();
         // The menus show the hotkeys the user configured, the same text the
         // Settings dialog and the Keyboard Shortcuts window use (9d).
-        let capture_hotkeys = CaptureMode::ALL
-            .iter()
-            .map(|mode| (*mode, settings.hotkey_text(*mode).trim().to_owned()))
-            .collect();
+        let capture_hotkeys =
+            shortcuts::capture_bindings(settings, self.capabilities.global_hotkeys);
         MenuState {
             can_undo: tab.is_some_and(Tab::can_undo),
             can_redo: tab.is_some_and(Tab::can_redo),
@@ -2694,6 +2919,7 @@ impl SnpLigaseApp {
             style,
             nodes,
             capture_hotkeys,
+            capabilities: self.capabilities,
         }
     }
 
@@ -2901,8 +3127,8 @@ impl SnpLigaseApp {
                 input.modifiers,
                 input.events.clone(),
                 input.viewport().focused != Some(false),
-                snp_ligase_platform::windows::keys::paste_held(),
-                snp_ligase_platform::windows::keys::shift_down(),
+                snp_ligase_platform::keys::paste_held(),
+                snp_ligase_platform::keys::shift_down(),
             )
         });
 
@@ -3542,24 +3768,28 @@ impl std::fmt::Debug for SnpLigaseApp {
     }
 }
 
+impl Drop for SnpLigaseApp {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.controller.window().detach_surface();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// SPEC 10 "Start with Windows": the login entry is touched only when the
+    /// setting really changes, so pressing OK on an unrelated change never
+    /// rewrites (or steals) it.
     #[test]
-    fn the_capture_copy_retry_policy() {
-        let now = std::time::Instant::now();
-        let copy = CaptureCopy {
-            image: std::sync::Arc::new(image::RgbaImage::new(1, 1)),
-            since: now,
-            last_try: now,
-            attempts: 1,
-            last_error: String::new(),
-        };
-        assert_eq!(copy.decide(now), CopyRetry::Wait);
-        assert_eq!(copy.decide(now + CAPTURE_COPY_RETRY), CopyRetry::Try);
-        assert_eq!(copy.decide(now + CAPTURE_COPY_WINDOW), CopyRetry::GiveUp);
+    fn the_login_entry_changes_only_when_the_setting_does() {
+        assert_eq!(autostart_change(false, true), Some(true));
+        assert_eq!(autostart_change(true, false), Some(false));
+        assert_eq!(autostart_change(false, false), None);
+        assert_eq!(autostart_change(true, true), None);
     }
+    use crate::clipboard::FakeClipboard;
     use image::RgbaImage;
     use snp_ligase_core::geom::Rect;
     use snp_ligase_core::model::defaults;
@@ -4426,6 +4656,131 @@ mod tests {
         assert!(sent(&commands, &egui::ViewportCommand::CancelClose));
     }
 
+    /// LINUX_SUPPORT.md section 3, item 8: where the platform has no tray icon
+    /// at all there is no way back from a closed window, so the X asks first.
+    fn app_without_a_platform_tray() -> SnpLigaseApp {
+        let mut app = app();
+        app.capabilities = Capabilities::NONE;
+        app.tray_installed = false;
+        app.close_hides = false;
+        app
+    }
+
+    #[test]
+    fn the_x_asks_before_quitting_where_the_platform_has_no_tray() {
+        let mut app = app_without_a_platform_tray();
+
+        let commands = run_close_request(&mut app);
+
+        assert_eq!(
+            app.pending_close,
+            Some(PendingClose::Quit),
+            "the X did not ask before quitting"
+        );
+        assert!(!app.exit, "the X exited without an answer");
+        assert!(
+            sent(&commands, &egui::ViewportCommand::CancelClose),
+            "the close request was not cancelled: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn the_close_decision_is_a_table() {
+        // With a tray that hides the window the X never quits (SPEC 6.1).
+        assert_eq!(close_choice(true, true, true), CloseChoice::Hide);
+        assert_eq!(close_choice(true, false, true), CloseChoice::Hide);
+        // A tray that failed to install on a platform that has one: G3's exit,
+        // with nothing new to click through — Windows is unchanged.
+        assert_eq!(close_choice(false, true, true), CloseChoice::Exit);
+        assert_eq!(close_choice(false, true, false), CloseChoice::Exit);
+        // No tray on the platform at all: ask, unless the user turned it off.
+        assert_eq!(close_choice(false, false, true), CloseChoice::AskQuit);
+        assert_eq!(close_choice(false, false, false), CloseChoice::Exit);
+    }
+
+    #[test]
+    fn answering_the_quit_prompt() {
+        let mut app = app_without_a_platform_tray();
+
+        // Cancel: the app stays, and the prompt is gone.
+        app.request_exit();
+        assert_eq!(app.pending_close, Some(PendingClose::Quit));
+        app.run(Action::CancelQuit);
+        assert!(!app.exit, "Cancel left anyway");
+        assert!(app.pending_close.is_none(), "the prompt is still up");
+        assert!(
+            app.settings.settings().ask_before_quitting,
+            "Cancel changed the setting"
+        );
+        assert!(app.status.contains("stays open"), "{}", app.status);
+
+        // Quit: the exit G1 lets through the close request.
+        app.request_exit();
+        app.run(Action::ConfirmQuit);
+        assert!(app.exit, "Quit did not leave");
+        assert!(
+            app.pending_close.is_none(),
+            "the prompt outlived the answer"
+        );
+    }
+
+    #[test]
+    fn dont_ask_again_switches_the_confirmation_off() {
+        let mut app = app_without_a_platform_tray();
+        app.request_exit();
+
+        app.quit_asks_again = false;
+        app.run(Action::ConfirmQuit);
+
+        assert!(app.exit, "Quit did not leave");
+        assert!(
+            !app.settings.settings().ask_before_quitting,
+            "the \"Don't ask again\" tick was not written to the settings"
+        );
+        assert!(
+            app.settings.dirty(),
+            "the setting is not on its way to the file"
+        );
+
+        // And the next exit asks nothing: the setting is what gates it.
+        app.exit = false;
+        app.request_exit();
+        assert!(app.exit, "it asked again after \"Don't ask again\"");
+        assert!(app.pending_close.is_none());
+    }
+
+    #[test]
+    fn the_unsaved_prompt_comes_before_the_quit_confirmation() {
+        // LINUX_SUPPORT.md section 3, item 8: "the unsaved-changes prompt still
+        // comes first when tabs are dirty".
+        let mut app = app_with_unsaved(1);
+        app.capabilities = Capabilities::NONE;
+        app.tray_installed = false;
+        app.close_hides = false;
+
+        run_close_request(&mut app);
+        assert!(
+            matches!(
+                app.pending_close,
+                Some(PendingClose::Tabs {
+                    then_exit: true,
+                    ..
+                })
+            ),
+            "the X asked to quit with unsaved work still open: {:?}",
+            app.pending_close
+        );
+
+        // Answering it closes the tab and only then asks about quitting.
+        app.confirm_close(false, &mut |_| None);
+        assert!(app.tabs.is_empty(), "the tab was not closed");
+        assert_eq!(app.pending_close, Some(PendingClose::Quit));
+        assert!(!app.exit, "the unsaved answer was taken for a quit");
+
+        app.run(Action::ConfirmQuit);
+        assert!(app.exit, "the quit confirmation was lost");
+    }
+
     #[test]
     fn a_tray_quit_with_clean_tabs_exits_without_showing_the_window() {
         // G2: the tray's Quit arrives while the window is hidden. With nothing
@@ -4781,6 +5136,7 @@ mod tests {
             warnings: Vec::new(),
             tray_installed: true,
             start_hidden: false,
+            capabilities: Capabilities::FULL,
         });
         app.run(Action::Settings);
         if let Some(draft) = app.settings_draft.as_mut() {
@@ -5858,6 +6214,7 @@ mod tests {
             warnings: Vec::new(),
             tray_installed: true,
             start_hidden: true,
+            capabilities: Capabilities::FULL,
         });
         assert_eq!(app.start_hidden, 1, "the setting was not picked up");
 
@@ -5907,6 +6264,7 @@ mod tests {
             warnings: Vec::new(),
             tray_installed: true,
             start_hidden: true,
+            capabilities: Capabilities::FULL,
         });
         assert_eq!(app.start_hidden, 1, "the setting was not picked up");
 
@@ -5968,6 +6326,7 @@ mod tests {
             warnings: Vec::new(),
             tray_installed: false,
             start_hidden: false,
+            capabilities: Capabilities::FULL,
         });
         assert_eq!(
             app.start_hidden, 0,
@@ -5980,7 +6339,7 @@ mod tests {
     // Recording a hotkey by pressing it (NEXT_STEPS step 7)
     // -----------------------------------------------------------------
 
-    use snp_ligase_platform::windows::keys::KeyboardSnapshot;
+    use snp_ligase_platform::keys::KeyboardSnapshot;
 
     /// A keyboard snapshot for the recorder tests. The real keyboard is never
     /// read: `start_hotkey_recording` takes one snapshot when it starts, and
@@ -6437,5 +6796,255 @@ mod tests {
             bigger > refitted,
             "the resize after Ctrl+1 did not re-fit: {refitted} -> {bigger}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    #[test]
+    fn w3_background_save_finds_original_tab_and_preserves_edits() {
+        let mut app = app();
+        app.controller.inject_event(UiEvent::NewCaptureSaved {
+            image: RgbaImage::new(3, 2),
+            copy: Ok(()),
+            id: 41,
+            saving: true,
+        });
+        app.drain_controller_events();
+        let tab_id = app.tabs[0].id();
+        dirty_rectangle(&mut app.tabs[0]);
+        app.controller.inject_event(UiEvent::NewCaptureSaved {
+            image: RgbaImage::new(4, 3),
+            copy: Ok(()),
+            id: 42,
+            saving: false,
+        });
+        app.drain_controller_events();
+        app.controller.inject_event(UiEvent::CaptureSaved {
+            id: 41,
+            result: Ok(PathBuf::from("first.png")),
+        });
+        app.drain_controller_events();
+        assert_eq!(app.tabs[0].id(), tab_id);
+        assert_eq!(app.tabs[0].path(), Some(std::path::Path::new("first.png")));
+        assert!(
+            app.tabs[0].dirty(),
+            "edits made during encoding were marked saved"
+        );
+        assert!(
+            app.tabs[1].path().is_none(),
+            "completion saved the active tab instead"
+        );
+        assert!(app.saving.is_empty());
+        assert!(app.capture_saves.is_empty());
+    }
+
+    #[test]
+    fn l3d_ui_does_not_copy_a_controller_completed_capture_again() {
+        let mut app = app();
+        let fake = FakeClipboard::default();
+        app.clipboard = ClipboardHandle::for_test(Box::new(fake.clone()));
+        app.controller.inject_event(UiEvent::NewCaptureSaved {
+            image: RgbaImage::new(3, 2),
+            copy: Ok(()),
+            id: 99,
+            saving: false,
+        });
+        app.drain_controller_events();
+        assert_eq!(app.tabs.len(), 1);
+        assert!(fake.copied().is_empty());
+        assert!(app.capture_copy.is_none());
+    }
+
+    // The clipboard (LINUX_SUPPORT.md L0c items 5-7)
+    // ---------------------------------------------------------------------
+
+    /// LINUX_SUPPORT.md L0c item 6: File > Copy and the paste after it go
+    /// through the one clipboard the app keeps.
+    ///
+    /// Before the fix every operation opened its own `arboard::Clipboard` and
+    /// dropped it again, which on Linux loses the copy the moment it is made
+    /// (the copying process is what serves the selection). The stand-in would
+    /// see nothing if either path still opened one of its own.
+    #[test]
+    fn copy_and_paste_use_the_apps_one_clipboard() {
+        let mut app = app_with_rects(1);
+        let fake = FakeClipboard::default();
+        app.clipboard = ClipboardHandle::for_test(Box::new(fake.clone()));
+        let pasted = vec![1, 2, 3, 255, 4, 5, 6, 255];
+
+        app.run(Action::CopyImage);
+        assert_eq!(fake.copied().len(), 1, "File > Copy: {}", app.status);
+
+        fake.set_paste_image(2, 1, pasted.clone());
+        app.run(Action::PasteAsNewTab);
+
+        assert_eq!(app.tabs.len(), 2, "the paste: {}", app.status);
+        assert_eq!(app.tabs[1].document.base.as_raw(), &pasted);
+        assert_eq!(fake.copied().len(), 1, "a second clipboard was opened");
+    }
+
+    /// LINUX_SUPPORT.md L0c item 7: the paste the app can rely on takes no
+    /// keyboard state at all. egui-winit swallows Ctrl+V and only reports it
+    /// when the clipboard also holds text, and Linux has no key-state poll
+    /// before L1, so the menu row (and the event egui does send) is the path
+    /// that works there.
+    #[test]
+    fn a_paste_needs_no_keyboard_state() {
+        let mut app = app();
+        let fake = FakeClipboard::default();
+        fake.set_paste_image(1, 1, vec![9, 9, 9, 255]);
+        app.clipboard = ClipboardHandle::for_test(Box::new(fake));
+
+        app.run(Action::PasteAsNewTab);
+
+        assert_eq!(app.tabs.len(), 1, "{}", app.status);
+        assert_eq!(app.tabs[0].document.base.as_raw(), &vec![9, 9, 9, 255]);
+    }
+
+    /// A clipboard without an image says so in the status bar.
+    #[test]
+    fn a_paste_with_no_image_says_so() {
+        let mut app = app();
+        app.clipboard = ClipboardHandle::for_test(Box::new(FakeClipboard::default()));
+
+        app.run(Action::PasteAsNewTab);
+
+        assert!(app.tabs.is_empty());
+        assert!(app.status.contains("holds no image"), "{}", app.status);
+    }
+
+    /// The daily-driver bug: with both "copy" and "auto-save" on, a capture
+    /// sometimes never reached the clipboard. Windows refuses the clipboard
+    /// while another program holds it, `arboard` gives up after ~25 ms, and
+    /// the failure line was replaced by "Auto-saved …" ~70 ms later. A refused
+    /// copy is now retried on later frames.
+    #[test]
+    fn a_refused_capture_copy_is_retried_until_it_lands() {
+        let mut app = app();
+        let fake = FakeClipboard::default();
+        fake.refuse_copies(3);
+        app.clipboard = ClipboardHandle::for_test(Box::new(fake.clone()));
+
+        app.controller
+            .inject_event(UiEvent::NewCapture(RgbaImage::new(3, 2)));
+        app.drain_controller_events();
+        assert!(fake.copied().is_empty());
+        let since = app.capture_copy.as_ref().expect("a retry is pending").since;
+
+        // Too soon: nothing is tried.
+        app.retry_capture_copy(since + CAPTURE_COPY_RETRY / 2);
+        assert_eq!(app.capture_copy.as_ref().map(|copy| copy.attempts), Some(1));
+
+        // Two more refusals, then the fourth try lands.
+        for step in 1..=3 {
+            app.retry_capture_copy(since + CAPTURE_COPY_RETRY * step);
+        }
+        assert!(app.capture_copy.is_none(), "the retry is still pending");
+        assert_eq!(fake.copied(), vec![(3, 2, vec![0; 3 * 2 * 4])]);
+        assert!(app.capture_copy_failed.is_none());
+    }
+
+    /// A clipboard that stays refused is reported, and the report survives the
+    /// auto-save's status line instead of being replaced by it.
+    #[test]
+    fn a_capture_copy_that_never_lands_is_reported_past_the_auto_save() {
+        let folder = temp_folder("copy-failed");
+        let mut app = app();
+        let mut settings = app.settings.settings().clone();
+        settings.auto_save_new_captures = true;
+        settings.save_folder = Some(folder.clone());
+        app.settings.replace(settings);
+        let fake = FakeClipboard::default();
+        fake.refuse_copies(usize::MAX);
+        app.clipboard = ClipboardHandle::for_test(Box::new(fake.clone()));
+
+        app.controller
+            .inject_event(UiEvent::NewCapture(RgbaImage::new(4, 4)));
+        app.drain_controller_events();
+        let since = app.capture_copy.as_ref().expect("a retry is pending").since;
+        app.retry_capture_copy(since + CAPTURE_COPY_WINDOW);
+
+        assert!(app.capture_copy.is_none(), "it never gave up");
+        assert!(
+            app.status.contains("clipboard copy failed"),
+            "{}",
+            app.status
+        );
+        wait_for_saves(&mut app);
+        assert!(app.status.contains("Auto-saved"), "{}", app.status);
+        assert!(
+            app.status.contains("clipboard copy failed"),
+            "the auto-save hid the failure: {}",
+            app.status
+        );
+
+        // File > Copy clears the note once it works.
+        fake.refuse_copies(0);
+        app.run(Action::CopyImage);
+        assert!(app.capture_copy_failed.is_none());
+        assert_eq!(fake.copied().len(), 1);
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn the_capture_copy_retry_policy() {
+        let now = std::time::Instant::now();
+        let copy = CaptureCopy {
+            image: std::sync::Arc::new(RgbaImage::new(1, 1)),
+            since: now,
+            last_try: now,
+            attempts: 1,
+            last_error: String::new(),
+        };
+        assert_eq!(copy.decide(now), CopyRetry::Wait);
+        assert_eq!(copy.decide(now + CAPTURE_COPY_RETRY), CopyRetry::Try);
+        assert_eq!(copy.decide(now + CAPTURE_COPY_WINDOW), CopyRetry::GiveUp);
+        // A clock that went backwards waits rather than panicking.
+        assert_eq!(
+            copy.decide(now.checked_sub(CAPTURE_COPY_RETRY).unwrap_or(now)),
+            CopyRetry::Wait
+        );
+    }
+
+    /// LINUX_SUPPORT.md L0c item 5: the family the loaded fonts report becomes
+    /// the default for new annotations (`Fonts::bundled`'s is "Inter", the
+    /// bundled test font — on Linux the real one comes from fontconfig).
+    #[test]
+    fn the_loaded_fonts_set_the_default_family() {
+        let mut app = app();
+        app.fonts_loading = Some(loaded_fonts());
+
+        app.poll_fonts();
+
+        assert_eq!(
+            app.styles.get(Tool::Text).expect("text").font_family,
+            "Inter",
+            "the loaded default family was not adopted"
+        );
+        assert!(app.fonts_ready(), "the fonts did not arrive");
+    }
+
+    /// An existing config keeps the family the user picked (L0c item 5).
+    #[test]
+    fn a_picked_font_survives_the_font_load() {
+        let mut app = app();
+        app.styles.get_mut(Tool::Text).expect("text").font_family = "Some Font".to_owned();
+        app.fonts_loading = Some(loaded_fonts());
+
+        app.poll_fonts();
+
+        assert_eq!(
+            app.styles.get(Tool::Text).expect("text").font_family,
+            "Some Font"
+        );
+    }
+
+    /// A channel that already holds the loaded fonts, so the test does not wait
+    /// for a background thread or depend on what is installed.
+    fn loaded_fonts() -> std::sync::mpsc::Receiver<snp_ligase_core::text::Fonts> {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(snp_ligase_core::text::Fonts::bundled())
+            .expect("send");
+        receiver
     }
 }

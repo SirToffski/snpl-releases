@@ -12,9 +12,25 @@ pub mod shortcuts;
 
 use egui::{MenuBar, Panel, RichText, Ui};
 use snp_ligase_core::model::Rgba;
+use snp_ligase_platform::Capabilities;
 
 use crate::tab::Tab;
 use crate::tool::{CORNER_RADII, STROKE_WIDTHS, TOOL_MENU, Tool, tool_for_row};
+
+/// Why a capture mode cannot run here, when the platform's capabilities do
+/// not have what it needs (LINUX_SUPPORT.md section 3, item 2).
+///
+/// One sentence per missing capability: a disabled menu row's hover text and a
+/// status-bar message (SPEC 8.1: what is wrong, in words). The facts come from
+/// [`Capabilities`]; only the words live here.
+pub const CAPTURE_UNAVAILABLE: &str = "Screen capture is not built for this platform yet.";
+pub const OVERLAY_UNAVAILABLE: &str = "The region overlay is not built for this platform yet.";
+pub const CURSOR_UNAVAILABLE: &str =
+    "Reading the cursor position is not built for this platform yet.";
+pub const ACTIVE_WINDOW_UNAVAILABLE: &str =
+    "Finding the active window is not built for this platform yet.";
+pub const HIDE_WINDOW_UNAVAILABLE: &str = "The window cannot be hidden on this platform yet.";
+pub const HOTKEYS_UNAVAILABLE: &str = "Global hotkeys are not built for this platform yet.";
 
 /// The four capture modes of SPEC 5.7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +73,38 @@ impl CaptureMode {
             Self::AllMonitors => "Ctrl+Shift+Print Screen",
             Self::ActiveWindow => "Shift+Print Screen",
             Self::RepeatLastRegion => "",
+        }
+    }
+
+    /// Why this mode cannot run with these capabilities, if it cannot: the
+    /// reason a disabled menu row and the status bar show (LINUX_SUPPORT.md
+    /// section 3, item 2). `None` means it can run.
+    ///
+    /// A missing capability is checked before the mode's own extras, so the
+    /// fundamental "no capture here" wins over "no cursor". When the backend
+    /// *named* why capture is impossible — the Wayland portal's absence —
+    /// that reason is carried out verbatim, and the plain "not built for
+    /// this platform yet" is the fallback for a platform without capture.
+    #[must_use]
+    pub fn blocked(self, capabilities: &Capabilities) -> Option<&'static str> {
+        if !capabilities.silent_capture {
+            return Some(capabilities.capture_reason.unwrap_or(CAPTURE_UNAVAILABLE));
+        }
+        match self {
+            Self::Region | Self::RepeatLastRegion if !capabilities.overlay => {
+                Some(OVERLAY_UNAVAILABLE)
+            }
+            Self::CurrentMonitor
+                if !capabilities.cursor_position && !capabilities.compositor_targets =>
+            {
+                Some(CURSOR_UNAVAILABLE)
+            }
+            Self::ActiveWindow
+                if !capabilities.active_window_rect && !capabilities.compositor_targets =>
+            {
+                Some(ACTIVE_WINDOW_UNAVAILABLE)
+            }
+            _ => None,
         }
     }
 }
@@ -108,6 +156,10 @@ pub enum Action {
     ConfirmSave,
     ConfirmDiscard,
     ConfirmCancel,
+    /// The two answers to "Quit snp-ligase?" (LINUX_SUPPORT.md section 3,
+    /// item 8). "Don't ask again" travels in the app's own state, not here.
+    ConfirmQuit,
+    CancelQuit,
     /// Right-click a point handle > "Delete point" (SPEC 7.3).
     DeletePoint(snp_ligase_core::edit::HandleKind),
     /// One change to a style property, from the Annotation menu or the
@@ -323,6 +375,10 @@ pub struct MenuState {
     /// Settings holds. It used to be `CaptureMode::hotkey()`, which only knows
     /// the SPEC 6.1 defaults, so a rebind never reached the menu.
     pub capture_hotkeys: Vec<(CaptureMode, String)>,
+    /// What the platform backend can really do (LINUX_SUPPORT.md section 3,
+    /// item 2): a mode missing a capability is a disabled row with a reason in
+    /// its hover text, never a clickable row that fails.
+    pub capabilities: Capabilities,
 }
 
 impl MenuState {
@@ -548,18 +604,24 @@ fn edit(ui: &mut Ui, state: &MenuState, actions: &mut Vec<Action>) {
 
 /// The Capture menu's rows, built before they are drawn (SPEC 8.3).
 ///
-/// Each row is the mode, the action, and whether it applies — with the
+/// Each row is the mode, the action, and why it cannot run — with the
 /// **user's own** hotkey in its text (NEXT_STEPS step 9d): the same text the
 /// Settings dialog's field and the Keyboard Shortcuts window show, not the
 /// SPEC 6.1 default `CaptureMode::hotkey()` knows. After a rebind the menu used
-/// to keep advertising "Print Screen".
+/// to keep advertising "Print Screen". The third element is the reason from
+/// [`CaptureMode::blocked`]; `None` means the row is enabled
+/// (LINUX_SUPPORT.md section 3, item 2).
 #[must_use]
-pub fn capture_rows(state: &MenuState) -> Vec<(String, Action, bool)> {
+pub fn capture_rows(state: &MenuState) -> Vec<(String, Action, Option<&'static str>)> {
     CaptureMode::ALL
         .iter()
         .map(|mode| {
             let label = capture_row_label(*mode, state.hotkey(*mode));
-            (label, Action::Capture(*mode), true)
+            (
+                label,
+                Action::Capture(*mode),
+                mode.blocked(&state.capabilities),
+            )
         })
         .collect()
 }
@@ -587,10 +649,20 @@ pub fn new_capture_hover(region_hotkey: &str) -> String {
 }
 
 /// Capture menu (SPEC 8.3). Each item shows its global hotkey.
+///
+/// A mode the platform cannot run is disabled with the reason in its hover
+/// text (LINUX_SUPPORT.md section 3, item 2), not hidden.
 fn capture(ui: &mut Ui, state: &MenuState, actions: &mut Vec<Action>) {
-    for (label, action, enabled) in capture_rows(state) {
+    for (label, action, blocked) in capture_rows(state) {
         // The hotkey is already in the label, so no shortcut is passed on.
-        item(ui, &label, "", action, enabled, actions);
+        let mut response = ui.add_enabled(blocked.is_none(), egui::Button::new(label));
+        if let Some(reason) = blocked {
+            response = response.on_disabled_hover_text(reason);
+        }
+        if response.clicked() {
+            actions.push(action);
+            ui.close();
+        }
     }
     ui.separator();
     ui.label("Delay");
@@ -1188,12 +1260,20 @@ pub fn toolbar(ui: &mut Ui, state: &MenuState, actions: &mut Vec<Action>) {
                     CaptureMode::AllMonitors,
                     CaptureMode::ActiveWindow,
                 ] {
-                    let response = ui.selectable_label(false, mode.label()).on_hover_text(
-                        match state.hotkey(mode) {
+                    // A mode the platform cannot run is disabled with the
+                    // reason, not hidden (LINUX_SUPPORT.md section 3, item 2).
+                    let blocked = mode.blocked(&state.capabilities);
+                    let mut response = ui.add_enabled(
+                        blocked.is_none(),
+                        egui::Button::new(mode.label()).selected(false),
+                    );
+                    response = match blocked {
+                        Some(reason) => response.on_disabled_hover_text(reason),
+                        None => response.on_hover_text(match state.hotkey(mode) {
                             "" => mode.label().to_owned(),
                             hotkey => format!("{} ({hotkey})", mode.label()),
-                        },
-                    );
+                        }),
+                    };
                     if response.clicked() {
                         actions.push(Action::Capture(mode));
                         ui.close();
@@ -1413,6 +1493,31 @@ pub fn unsaved_prompt(ui: &mut Ui, title: &str, plural: bool, actions: &mut Vec<
         });
 }
 
+/// "Quit snp-ligase?" (LINUX_SUPPORT.md section 3, item 8).
+///
+/// Shown on a platform with no tray icon, where the window's X is the only way
+/// out: one click too many would end the user's session. `ask_again` is the
+/// "Don't ask again" tick, stored in the config by the app when it is off.
+pub fn quit_prompt(ui: &mut Ui, ask_again: &mut bool, actions: &mut Vec<Action>) {
+    let mut open = true;
+    egui::Window::new("Quit snp-ligase?")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .show(ui.ctx(), |ui| {
+            ui.checkbox(ask_again, "Don't ask again");
+            ui.horizontal(|ui| {
+                if ui.button("Quit").clicked() {
+                    actions.push(Action::ConfirmQuit);
+                }
+                if ui.button("Cancel").clicked() {
+                    actions.push(Action::CancelQuit);
+                }
+            });
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1599,6 +1704,59 @@ mod tests {
         );
     }
 
+    /// LINUX_SUPPORT.md section 3, item 8: the "Quit snp-ligase?" modal — the
+    /// question, the two answers and the "Don't ask again" tick, through the
+    /// real widgets.
+    #[test]
+    fn the_quit_prompt_answers_quit_cancel_and_dont_ask_again() {
+        use egui_kittest::kittest::Queryable as _;
+
+        struct State {
+            ask_again: bool,
+            actions: Vec<Action>,
+        }
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            |ui, state: &mut State| quit_prompt(ui, &mut state.ask_again, &mut state.actions),
+            State {
+                ask_again: true,
+                actions: Vec::new(),
+            },
+        );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("Quit snp-ligase?")
+                .is_some(),
+            "the modal does not ask the question"
+        );
+
+        // "Don't ask again" is a checkbox whose state the app owns.
+        harness.get_by_label("Don't ask again").click();
+        harness.run();
+        assert!(
+            !harness.state().ask_again,
+            "the tick did not reach the state"
+        );
+
+        harness.get_by_label("Quit").click();
+        harness.run();
+        assert_eq!(
+            harness.state().actions.as_slice(),
+            [Action::ConfirmQuit],
+            "Quit did not report itself"
+        );
+
+        // Cancel is its own answer: the app keeps running and keeps asking.
+        harness.state_mut().actions.clear();
+        harness.get_by_label("Cancel").click();
+        harness.run();
+        assert_eq!(
+            harness.state().actions.as_slice(),
+            [Action::CancelQuit],
+            "Cancel did not report itself"
+        );
+    }
+
     fn state(nodes: Vec<StyleNode>, has_selection: bool) -> MenuState {
         MenuState {
             can_undo: false,
@@ -1615,6 +1773,7 @@ mod tests {
             style: Some(ToolStyle::default()),
             nodes,
             capture_hotkeys: Vec::new(),
+            capabilities: Capabilities::FULL,
         }
     }
 
@@ -1735,7 +1894,7 @@ mod tests {
         let state = state_with_hotkeys(["Ctrl+Alt+P", "F9", "F10", "F11"]);
         let actions: Vec<Action> = capture_rows(&state)
             .into_iter()
-            .map(|(_label, action, _enabled)| action)
+            .map(|(_label, action, _blocked)| action)
             .collect();
         let wanted: Vec<Action> = CaptureMode::ALL
             .iter()
@@ -1743,6 +1902,218 @@ mod tests {
             .map(Action::Capture)
             .collect();
         assert_eq!(actions, wanted);
+    }
+
+    /// LINUX_SUPPORT.md section 3, item 2: a mode whose capability is missing
+    /// is blocked with a reason, and the reason names the missing piece — not
+    /// "disabled" or a question mark (SPEC 8.1).
+    #[test]
+    fn a_capture_mode_says_which_capability_it_is_missing() {
+        for mode in CaptureMode::ALL {
+            assert_eq!(
+                mode.blocked(&Capabilities::FULL),
+                None,
+                "{mode:?} is blocked on a full platform"
+            );
+        }
+
+        // Nothing at all: every mode blames capture, the fundamental piece.
+        for mode in CaptureMode::ALL {
+            assert_eq!(
+                mode.blocked(&Capabilities::NONE),
+                Some(CAPTURE_UNAVAILABLE),
+                "{mode:?}"
+            );
+        }
+
+        // Capture but no overlay: only the modes that need the overlay are
+        // blocked; the others still run.
+        let no_overlay = Capabilities {
+            overlay: false,
+            ..Capabilities::FULL
+        };
+        assert_eq!(
+            CaptureMode::Region.blocked(&no_overlay),
+            Some(OVERLAY_UNAVAILABLE)
+        );
+        assert_eq!(
+            CaptureMode::RepeatLastRegion.blocked(&no_overlay),
+            Some(OVERLAY_UNAVAILABLE),
+            "repeat last region needs a region the overlay produced"
+        );
+        assert_eq!(CaptureMode::AllMonitors.blocked(&no_overlay), None);
+        assert_eq!(CaptureMode::CurrentMonitor.blocked(&no_overlay), None);
+        assert_eq!(CaptureMode::ActiveWindow.blocked(&no_overlay), None);
+
+        // The two ways the platform finds things are named separately.
+        let no_cursor = Capabilities {
+            cursor_position: false,
+            capture_cursor: false,
+            ..Capabilities::FULL
+        };
+        assert_eq!(
+            CaptureMode::CurrentMonitor.blocked(&no_cursor),
+            Some(CURSOR_UNAVAILABLE)
+        );
+        assert_eq!(CaptureMode::AllMonitors.blocked(&no_cursor), None);
+        let no_active_window = Capabilities {
+            active_window_rect: false,
+            ..Capabilities::FULL
+        };
+        assert_eq!(
+            CaptureMode::ActiveWindow.blocked(&no_active_window),
+            Some(ACTIVE_WINDOW_UNAVAILABLE)
+        );
+        assert_eq!(CaptureMode::AllMonitors.blocked(&no_active_window), None);
+    }
+
+    /// LINUX_SUPPORT.md section 4, phases L1a and L1b: with the X11 backend's
+    /// own capability list every capture mode runs, Region and Repeat last
+    /// region included — they are L1b's overlay, the child process
+    /// `select_region` starts. Reading the backend's constant means a later
+    /// phase that changes what the backend can do updates this test with it
+    /// instead of leaving a stale expectation behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_x11_capabilities_leave_every_capture_mode_runnable() {
+        use snp_ligase_platform::HotkeySupport;
+
+        let capabilities = snp_ligase_platform::linux::x11::CAPABILITIES;
+
+        assert!(
+            capabilities.overlay,
+            "the region overlay is L1b and the backend does it"
+        );
+        for mode in CaptureMode::ALL {
+            assert_eq!(mode.blocked(&capabilities), None, "{mode:?} is blocked");
+        }
+
+        // The L0b review carry-over: X11 registers hotkeys itself, so Settings
+        // > Hotkeys is enabled there again.
+        assert_ne!(capabilities.global_hotkeys, HotkeySupport::None);
+    }
+
+    /// LINUX_SUPPORT.md section 6, L3b: with the Wayland backend's capability
+    /// list, Region, All Monitors and Repeat Last Region run, and the two
+    /// modes that need the session cursor or the active window are blocked
+    /// with *their* reasons — Wayland has no such thing to read. A portal-less
+    /// session disables capture with a reason naming the missing portal, and
+    /// `blocked` carries that reason out instead of the generic one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_wayland_capabilities_block_exactly_what_they_cannot_do() {
+        use snp_ligase_platform::{HotkeySupport, linux::wayland};
+
+        let capabilities = wayland::CAPABILITIES;
+
+        assert!(capabilities.silent_capture, "the portal capture is the one");
+        assert!(capabilities.overlay, "the Wayland overlay windows are L3b");
+        assert!(
+            capabilities.hide_main_window,
+            "Wayland minimizes before capture"
+        );
+        assert!(
+            !capabilities.cursor_position,
+            "Wayland has no cursor position to read"
+        );
+        assert!(
+            !capabilities.active_window_rect,
+            "Wayland has no active window to read"
+        );
+        assert_eq!(
+            capabilities.global_hotkeys,
+            HotkeySupport::Portal,
+            "the desktop owns global shortcuts"
+        );
+
+        assert_eq!(CaptureMode::Region.blocked(&capabilities), None);
+        assert_eq!(CaptureMode::AllMonitors.blocked(&capabilities), None);
+        assert_eq!(CaptureMode::RepeatLastRegion.blocked(&capabilities), None);
+        assert_eq!(
+            CaptureMode::CurrentMonitor.blocked(&capabilities),
+            Some(CURSOR_UNAVAILABLE)
+        );
+        assert_eq!(
+            CaptureMode::ActiveWindow.blocked(&capabilities),
+            Some(ACTIVE_WINDOW_UNAVAILABLE)
+        );
+
+        // A portal-less session: the backend's own reason reaches the rows.
+        let no_portal = Capabilities {
+            silent_capture: false,
+            capture_reason: Some(wayland::portal::NO_PORTAL_REASON),
+            ..Capabilities::FULL
+        };
+        for mode in CaptureMode::ALL {
+            assert_eq!(
+                mode.blocked(&no_portal),
+                Some(wayland::portal::NO_PORTAL_REASON),
+                "named portal reason for {mode:?}"
+            );
+        }
+    }
+
+    /// The same reasons reach the Capture menu's rows, so the disabled row and
+    /// the status bar cannot disagree.
+    #[test]
+    fn capture_rows_carry_the_blocked_reason() {
+        let mut state = state_with_hotkeys(["Ctrl+Alt+P", "F9", "F10", "F11"]);
+        state.capabilities = Capabilities::NONE;
+        let blocked: Vec<Option<&'static str>> = capture_rows(&state)
+            .into_iter()
+            .map(|(_, _, blocked)| blocked)
+            .collect();
+        assert_eq!(
+            blocked,
+            vec![Some(CAPTURE_UNAVAILABLE); CaptureMode::ALL.len()]
+        );
+
+        let mut state = state_with_hotkeys(["Ctrl+Alt+P", "F9", "F10", "F11"]);
+        state.capabilities = Capabilities {
+            cursor_position: false,
+            capture_cursor: false,
+            ..Capabilities::FULL
+        };
+        let blocked: Vec<Option<&'static str>> = capture_rows(&state)
+            .into_iter()
+            .map(|(_, _, blocked)| blocked)
+            .collect();
+        assert_eq!(blocked[1], Some(CURSOR_UNAVAILABLE), "{blocked:?}");
+        assert_eq!(blocked[0], None, "{blocked:?}");
+    }
+
+    /// The rendered Capture menu: with no capture capability the row is
+    /// disabled (a click produces nothing) and the same reason is its hover
+    /// text — not a clickable row that fails (LINUX_SUPPORT.md section 3,
+    /// item 2).
+    #[test]
+    fn the_capture_menu_disables_what_the_platform_cannot_do() {
+        use egui_kittest::kittest::{NodeT as _, Queryable as _};
+
+        let mut menu_state = state_with_hotkeys(["Ctrl+Alt+P", "F9", "F10", "F11"]);
+        menu_state.capabilities = Capabilities::NONE;
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, actions: &mut Vec<Action>| {
+                menu_bar(ui, &menu_state, actions);
+            },
+            Vec::<Action>::new(),
+        );
+        harness.run();
+        harness.get_by_label("Capture").click();
+        harness.run();
+
+        let row = harness.get_by_label_contains("Region    Ctrl+Alt+P");
+        assert!(
+            row.accesskit_node().is_disabled(),
+            "a mode without capture is still clickable"
+        );
+        row.click();
+        harness.run();
+        assert!(
+            harness.state().is_empty(),
+            "a disabled row produced an action: {:?}",
+            harness.state()
+        );
     }
 
     /// The row text itself: the hotkey is part of the label, and a mode with
@@ -2059,5 +2430,31 @@ mod tests {
                 "{label} is missing from the menu"
             );
         }
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    #[test]
+    fn w3_kde_menus_enable_compositor_targets() {
+        let other = snp_ligase_platform::linux::wayland::CAPABILITIES;
+        let kde = Capabilities {
+            compositor_targets: true,
+            ..other
+        };
+        let mut state = state_with_hotkeys(["", "", "", ""]);
+        state.capabilities = kde;
+        let rows = capture_rows(&state);
+        for (label, action, blocked) in rows {
+            if matches!(
+                action,
+                Action::Capture(CaptureMode::CurrentMonitor | CaptureMode::ActiveWindow)
+            ) {
+                assert!(blocked.is_none(), "{label} is still disabled");
+            }
+        }
+        for mode in [CaptureMode::CurrentMonitor, CaptureMode::ActiveWindow] {
+            assert!(mode.blocked(&other).is_some());
+            assert_eq!(mode.blocked(&kde), None);
+        }
+        assert_eq!(CaptureMode::CurrentMonitor.label(), "Current Monitor");
+        assert_eq!(CaptureMode::CurrentMonitor.label(), "Current Monitor");
     }
 }

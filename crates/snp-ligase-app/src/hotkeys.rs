@@ -432,7 +432,7 @@ pub struct RecorderInput {
 impl RecorderInput {
     /// From the platform's keyboard snapshot.
     #[must_use]
-    pub fn from_snapshot(snapshot: &snp_ligase_platform::windows::keys::KeyboardSnapshot) -> Self {
+    pub fn from_snapshot(snapshot: &snp_ligase_platform::keys::KeyboardSnapshot) -> Self {
         Self {
             ctrl: snapshot.ctrl,
             shift: snapshot.shift,
@@ -523,34 +523,41 @@ impl Recorder {
     }
 }
 
-thread_local! {
-    /// The bindings the installed global-hotkey event handler matches against.
-    ///
-    /// `global-hotkey` 0.8.0 keeps the handler in a `OnceCell`
-    /// (`global-hotkey-0.8.0/src/lib.rs:89`): the first `set_event_handler`
-    /// call wins and later ones are silently ignored (`lib.rs:118-124`). The
-    /// handler therefore cannot capture one rebind's bindings; it reads this
-    /// table, which every rebind replaces. Without it, a hotkey recorded in
-    /// Settings is registered but its events are dropped by the stale startup
-    /// handler — found by the Step 7 real run (the `hotkey registered` line
-    /// without a later `hotkey pressed`).
-    ///
-    /// A thread-local, not a static: the handler runs on the thread whose
-    /// message loop dispatches WM_HOTKEY, which is the thread that created the
-    /// manager and calls [`Hotkeys::rebind`] (the main thread, SPEC 6.2). A
-    /// thread-local also keeps parallel tests from racing on one table.
-    static HANDLER_BINDINGS: std::cell::RefCell<Vec<Binding>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
+/// The bindings the installed global-hotkey event handler matches against.
+///
+/// `global-hotkey` 0.8.0 keeps the handler in a `OnceCell`
+/// (`global-hotkey-0.8.0/src/lib.rs:89`): the first `set_event_handler`
+/// call wins and later ones are silently ignored (`lib.rs:118-124`). The
+/// handler therefore cannot capture one rebind's bindings; it reads this
+/// table, which every rebind replaces. Without it, a hotkey recorded in
+/// Settings is registered but its events are dropped by the stale startup
+/// handler — found by the Step 7 real run (the `hotkey registered` line
+/// without a later `hotkey pressed`).
+///
+/// A **process-wide** table, not a thread-local: on Windows the handler runs
+/// on the main thread's message pump, but on X11 `global-hotkey` calls it from
+/// a thread of its own (`global-hotkey-0.8.0/src/platform_impl/x11/mod.rs`,
+/// `std::thread::spawn` in `GlobalHotKeyManager::new`), where a thread-local
+/// would always be empty — the keys would register and never fire
+/// (LINUX_SUPPORT.md section 4).
+static HANDLER_BINDINGS: std::sync::Mutex<Vec<Binding>> = std::sync::Mutex::new(Vec::new());
 
 /// Replaces the table the event handler reads.
 fn set_handler_bindings(bindings: Vec<Binding>) {
-    HANDLER_BINDINGS.with(|cell| *cell.borrow_mut() = bindings);
+    // A poisoned lock means a panic happened while the table was held; the
+    // table itself is still a valid `Vec`, so the hotkeys keep working.
+    let mut table = HANDLER_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *table = bindings;
 }
 
 /// The table the event handler reads.
 fn handler_bindings() -> Vec<Binding> {
-    HANDLER_BINDINGS.with(|cell| cell.borrow().clone())
+    HANDLER_BINDINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 /// The mode an event id belongs to, from the bindings that are registered.
@@ -572,11 +579,17 @@ pub struct Hotkeys {
     /// True for [`Hotkeys::none`]: a guard that must never touch the real
     /// keyboard, which is what a test gets.
     inert: bool,
+    #[cfg(target_os = "linux")]
+    portal: Option<snp_ligase_platform::linux::wayland::shortcuts::Shortcuts>,
     /// One entry per `rebind` call, in order. Only written in tests: it is how
     /// a test proves that a recording's guard put the stored bindings back on
     /// every exit path without ever touching the real keyboard.
     #[cfg(test)]
     rebind_log: Vec<Vec<Binding>>,
+    /// What each `release` saw in `bindings`, whether or not a manager was
+    /// live. A rebind must hand back the **old** keys, not the new ones.
+    #[cfg(test)]
+    release_log: Vec<Vec<Binding>>,
 }
 
 impl Hotkeys {
@@ -586,10 +599,13 @@ impl Hotkeys {
     #[must_use]
     pub fn none() -> Self {
         Self {
+            #[cfg(target_os = "linux")]
+            portal: None,
             manager: None,
             bindings: Vec::new(),
             inert: true,
             rebind_log: Vec::new(),
+            release_log: Vec::new(),
         }
     }
 
@@ -598,11 +614,15 @@ impl Hotkeys {
     /// from the Settings dialog.
     fn empty() -> Self {
         Self {
+            #[cfg(target_os = "linux")]
+            portal: None,
             manager: None,
             bindings: Vec::new(),
             inert: false,
             #[cfg(test)]
             rebind_log: Vec::new(),
+            #[cfg(test)]
+            release_log: Vec::new(),
         }
     }
 
@@ -617,12 +637,69 @@ impl Hotkeys {
         (hotkeys, warnings)
     }
 
+    /// The desktop owns these bindings; Settings never re-registers them.
+    #[cfg(target_os = "linux")]
+    pub fn register_portal(
+        capabilities: snp_ligase_platform::Capabilities,
+        commands: Sender<AppCommand>,
+        events: Sender<crate::controller::UiEvent>,
+        window: std::sync::Arc<crate::controller::WindowGate>,
+    ) -> (Self, Vec<String>) {
+        use snp_ligase_platform::linux::wayland::shortcuts::{self, Event};
+        let requested = portal_requests(&capabilities);
+        let mut guard = Self::empty();
+        // Inert even after failure: no accidental global-hotkey/XWayland fallback.
+        guard.inert = true;
+        match shortcuts::start(requested, move |event| match event {
+            Event::Activated { id, token } => {
+                if let Some(mode) = [
+                    CaptureMode::Region,
+                    CaptureMode::CurrentMonitor,
+                    CaptureMode::ActiveWindow,
+                    CaptureMode::AllMonitors,
+                    CaptureMode::RepeatLastRegion,
+                ]
+                .into_iter()
+                .find(|mode| portal_id(*mode) == id)
+                {
+                    let _ = commands.send(AppCommand::ActivatedCapture {
+                        mode,
+                        delay_seconds: 0,
+                        token,
+                    });
+                }
+            }
+            Event::Status(message) => {
+                let _ = events.send(crate::controller::UiEvent::Warning(message));
+                window.wake();
+            }
+        }) {
+            Ok(portal) => {
+                guard.portal = Some(portal);
+                (guard, Vec::new())
+            }
+            Err(err) => (guard, vec![format!("Global hotkeys unavailable: {err}")]),
+        }
+    }
+
     /// Replaces the registered keys with `bindings` (the Settings dialog's OK).
     ///
     /// Returns the same warnings [`Hotkeys::register`] does.
     pub fn rebind(&mut self, commands: Sender<AppCommand>, bindings: Vec<Binding>) -> Vec<String> {
+        #[cfg(target_os = "linux")]
+        if self.portal.is_some() {
+            return Vec::new();
+        }
         #[cfg(test)]
         self.rebind_log.push(bindings.clone());
+        // Hand the old keys back **before** the table names the new ones:
+        // `release` unregisters what `self.bindings` says, and those are the
+        // keys the manager actually holds. On X11 dropping the manager only
+        // *asks* its own thread to close the connection (up to a 50 ms poll
+        // later), so the explicit unregister is what keeps a rebind from
+        // registering against grabs the old manager still holds; without it
+        // every line of Settings > OK reads "could not be registered".
+        self.release();
         self.bindings = bindings;
         // The handler is installed once for the life of the process (see
         // `HANDLER_BINDINGS`); this is the table it reads, so it is replaced
@@ -632,9 +709,6 @@ impl Hotkeys {
             tracing::debug!("this guard never registers hotkeys (a test, or none)");
             return Vec::new();
         }
-        // Dropping the old manager destroys the message-only window the keys
-        // were registered on, which is what unregisters them.
-        self.manager = None;
         let mut warnings = Vec::new();
 
         let manager = match GlobalHotKeyManager::new() {
@@ -691,17 +765,42 @@ impl Hotkeys {
     /// Unregisters every key while a recording is in progress (NEXT_STEPS
     /// step 7).
     ///
-    /// The recorder reads the keyboard with `GetAsyncKeyState`, which sees a
-    /// press even while one of our own hotkeys owns it — but the handler would
-    /// still fire a capture behind the Settings dialog. Dropping the manager
-    /// takes every key out of the way; the recording guard re-registers the
-    /// bindings it suspended when the recording ends.
+    /// The recorder reads the keyboard with `QueryKeymap`/`GetAsyncKeyState`,
+    /// which sees a press even while one of our own hotkeys owns it — but the
+    /// handler would still fire a capture behind the Settings dialog. Handing
+    /// the keys back takes every one of them out of the way; the recording
+    /// guard re-registers the bindings it suspended when the recording ends.
     pub fn suspend(&mut self) {
         if self.inert {
             return;
         }
-        if self.manager.take().is_some() {
+        if self.manager.is_some() {
+            self.release();
             tracing::info!("global hotkeys unregistered while a hotkey is recorded");
+        }
+    }
+
+    /// Hands every registered key back to the platform and drops the manager.
+    ///
+    /// The explicit `unregister` calls are what make a rebind work on X11:
+    /// dropping the manager only *asks* its own thread to close its X
+    /// connection, which is when the server releases the grabs, and the next
+    /// registration can happen before that thread has woken up.
+    fn release(&mut self) {
+        #[cfg(test)]
+        self.release_log.push(self.bindings.clone());
+        if let Some(manager) = self.manager.take() {
+            for binding in &self.bindings {
+                if let Err(err) = manager.unregister(binding.hotkey) {
+                    // A key that failed to register is not registered now
+                    // either; that is not worth a warning line.
+                    tracing::debug!(
+                        hotkey = %display_hotkey(&binding.hotkey),
+                        error = %err,
+                        "a hotkey could not be handed back"
+                    );
+                }
+            }
         }
     }
 
@@ -711,6 +810,15 @@ impl Hotkeys {
     #[must_use]
     pub fn rebind_log(&self) -> &[Vec<Binding>] {
         &self.rebind_log
+    }
+
+    /// What each `release` saw, in order. Tests use it to prove that a rebind
+    /// handed back the old keys rather than the ones it is replacing them
+    /// with.
+    #[cfg(test)]
+    #[must_use]
+    fn release_log(&self) -> &[Vec<Binding>] {
+        &self.release_log
     }
 }
 
@@ -742,6 +850,17 @@ fn registration_warning(binding: &Binding, reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The binding table is process-wide, so the tests that touch it must not
+    /// run at the same time as each other: every one of them takes this lock.
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The lock, unpoisoned: one failing test must not break the others.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     #[test]
     fn the_defaults_are_the_four_spec_modes() {
@@ -1225,8 +1344,43 @@ mod tests {
         );
     }
 
+    /// LINUX_SUPPORT.md section 4: on X11 `global-hotkey` calls the handler
+    /// from a thread of its own, so the table a rebind installs has to be
+    /// visible from another thread. A thread-local table would be empty there
+    /// and every hotkey would register without ever firing.
+    #[test]
+    fn the_binding_table_is_process_wide_so_the_x11_handler_thread_sees_it() {
+        let _guard = test_lock();
+        let binding = Binding {
+            hotkey: HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP),
+            mode: CaptureMode::Region,
+        };
+
+        // What a rebind does, on the main thread...
+        set_handler_bindings(vec![binding]);
+        // ...has to be what a second thread — where the X11 handler runs —
+        // reads.
+        let seen = std::thread::scope(|scope| {
+            scope
+                .spawn(handler_bindings)
+                .join()
+                .expect("the reader thread")
+        });
+        assert_eq!(
+            seen,
+            vec![binding],
+            "the handler thread sees an empty table"
+        );
+
+        // The other direction too: the table a rebind replaces is gone for
+        // every thread.
+        set_handler_bindings(Vec::new());
+        assert!(handler_bindings().is_empty());
+    }
+
     #[test]
     fn suspending_does_not_register_anything_and_the_bindings_can_go_back() {
+        let _guard = test_lock();
         let (sender, _receiver) = std::sync::mpsc::channel();
         let mut hotkeys = Hotkeys::none();
         let bindings = default_bindings();
@@ -1240,6 +1394,35 @@ mod tests {
         assert_eq!(log[1], bindings, "the bindings were not put back");
     }
 
+    #[test]
+    fn a_rebind_hands_back_the_keys_the_old_manager_holds() {
+        let _guard = test_lock();
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let mut hotkeys = Hotkeys::none();
+        let old = Binding {
+            hotkey: HotKey::new(None, Code::PrintScreen),
+            mode: CaptureMode::Region,
+        };
+        let new = Binding {
+            hotkey: HotKey::new(Some(Modifiers::CONTROL | Modifiers::ALT), Code::KeyP),
+            mode: CaptureMode::Region,
+        };
+
+        hotkeys.rebind(sender.clone(), vec![old]);
+        hotkeys.rebind(sender, vec![new]);
+
+        // The first rebind has nothing to hand back; the second must hand back
+        // the key the first one registered. Before this was ordered correctly
+        // it handed back the *new* key, which the manager did not hold — and
+        // on X11 the old grab stayed until the manager's thread happened to
+        // close its connection.
+        assert_eq!(
+            hotkeys.release_log(),
+            &[Vec::new(), vec![old]],
+            "a rebind handed back the wrong keys"
+        );
+    }
+
     /// The bug the Step 7 real run found: `global-hotkey` installs only the
     /// first event handler and ignores every later `set_event_handler` call
     /// (`global-hotkey-0.8.0/src/lib.rs:89`, 118-124), so a handler that
@@ -1247,6 +1430,7 @@ mod tests {
     /// read the table a rebind replaces; this pins the lookup it uses.
     #[test]
     fn the_event_handler_reads_the_bindings_a_rebind_put_in_place() {
+        let _guard = test_lock();
         let (sender, _receiver) = std::sync::mpsc::channel();
         let mut hotkeys = Hotkeys::none();
         let print_screen = Binding {
@@ -1278,4 +1462,116 @@ mod tests {
             "the handler still matches the registration it replaced"
         );
     }
+}
+
+/// KDE preferred-trigger spelling (the portal does not accept XDG angle brackets).
+#[cfg(test)]
+fn kde_trigger(key: &HotKey) -> String {
+    let mut parts = Vec::new();
+    for (flag, name) in [
+        (Modifiers::CONTROL, "CTRL"),
+        (Modifiers::ALT, "ALT"),
+        (Modifiers::SHIFT, "SHIFT"),
+        (Modifiers::SUPER, "META"),
+    ] {
+        if key.mods.contains(flag) {
+            parts.push(name.to_owned());
+        }
+    }
+    let name = match key.key {
+        Code::PrintScreen => "Print".to_owned(),
+
+        _ => format!("{}", key.key)
+            .trim_start_matches("Key")
+            .trim_start_matches("Digit")
+            .to_owned(),
+    };
+    parts.push(name);
+    parts.join("+")
+}
+
+#[cfg(test)]
+mod portal_tests {
+    use super::*;
+    #[test]
+    fn kde_triggers_cover_defaults_and_custom_binding() {
+        let actual: Vec<_> = default_bindings()
+            .iter()
+            .map(|b| kde_trigger(&b.hotkey))
+            .collect();
+        assert_eq!(
+            actual,
+            ["Print", "CTRL+Print", "SHIFT+Print", "CTRL+SHIFT+Print"]
+        );
+        assert_eq!(
+            kde_trigger(&parse_hotkey("Ctrl+Alt+P").unwrap().unwrap()),
+            "CTRL+ALT+P"
+        );
+    }
+}
+
+/// Stable desktop ids preserve bindings across versions and key changes.
+pub fn portal_id(mode: CaptureMode) -> &'static str {
+    match mode {
+        CaptureMode::Region => "region",
+        CaptureMode::CurrentMonitor => "monitor",
+        CaptureMode::ActiveWindow => "window",
+        CaptureMode::AllMonitors => "all",
+        CaptureMode::RepeatLastRegion => "repeat",
+    }
+}
+
+/// Portal defaults intentionally differ from SPEC 6.1 on Wayland.
+#[cfg(target_os = "linux")]
+fn portal_requests(
+    capabilities: &snp_ligase_platform::Capabilities,
+) -> Vec<(String, String, Option<String>)> {
+    [
+        (CaptureMode::Region, Some("CTRL+Print")),
+        (CaptureMode::AllMonitors, Some("CTRL+SHIFT+Print")),
+        (CaptureMode::RepeatLastRegion, None),
+        (CaptureMode::CurrentMonitor, None),
+        (CaptureMode::ActiveWindow, None),
+    ]
+    .into_iter()
+    .filter(|(mode, _)| mode.blocked(capabilities).is_none())
+    .map(|(mode, trigger)| {
+        (
+            portal_id(mode).into(),
+            mode.label().into(),
+            trigger.map(str::to_owned),
+        )
+    })
+    .collect()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn l3d_portal_registers_only_supported_modes() {
+    let rows = portal_requests(&snp_ligase_platform::linux::wayland::CAPABILITIES);
+    assert_eq!(
+        rows.into_iter()
+            .map(|(id, _, trigger)| (id, trigger))
+            .collect::<Vec<_>>(),
+        vec![
+            ("region".into(), Some("CTRL+Print".into())),
+            ("all".into(), Some("CTRL+SHIFT+Print".into())),
+            ("repeat".into(), None)
+        ]
+    );
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn w3_kde_shortcuts_add_targets_without_preferred_triggers() {
+    let capabilities = snp_ligase_platform::Capabilities {
+        compositor_targets: true,
+        ..snp_ligase_platform::linux::wayland::CAPABILITIES
+    };
+    let rows = portal_requests(&capabilities);
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[3], ("monitor".into(), "Current Monitor".into(), None));
+    assert_eq!(rows[4], ("window".into(), "Active Window".into(), None));
+    assert_eq!(rows[0].2.as_deref(), Some("CTRL+Print"));
+    assert_eq!(rows[1].2.as_deref(), Some("CTRL+SHIFT+Print"));
 }

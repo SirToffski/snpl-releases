@@ -366,6 +366,31 @@ impl ToolStyles {
             Tool::Select | Tool::Crop => None,
         }
     }
+
+    /// Takes `family` as this machine's default font (LINUX_SUPPORT.md section
+    /// 3, item 5): every style still carrying the name SPEC 7.5 starts from
+    /// gets it.
+    ///
+    /// "Segoe UI" is Windows-only, so on Linux the app adopts the family the
+    /// loaded database resolved for `sans-serif` once the fonts have loaded.
+    /// Anything else in a style came from the config, which means the user
+    /// picked it out of the combo box — that is never touched. True when some
+    /// style changed.
+    pub fn adopt_default_family(&mut self, family: &str) -> bool {
+        let mut changed = false;
+        for tool in Tool::ALL {
+            let Some(style) = self.get_mut(tool) else {
+                continue;
+            };
+            if style.font_family == snp_ligase_core::text::DEFAULT_FAMILY
+                && family != snp_ligase_core::text::DEFAULT_FAMILY
+            {
+                style.font_family = family.to_owned();
+                changed = true;
+            }
+        }
+        changed
+    }
 }
 
 /// Where an arrow's heads go (SPEC section 8.3).
@@ -488,6 +513,46 @@ mod tests {
         assert_eq!(style.fill, None, "SPEC 7.7: rectangle no fill");
         assert!(style.curved, "SPEC 7.3: new paths are curved");
         assert!(!style.shadow, "SPEC 7.7: shadow off");
+    }
+
+    /// LINUX_SUPPORT.md L0c item 5: the loaded default family replaces the
+    /// Windows-only name every style starts from, and nothing else.
+    #[test]
+    fn the_system_default_family_replaces_only_the_unpicked_name() {
+        let mut styles = ToolStyles::default();
+        // What a config holds when the user has picked a family.
+        styles.get_mut(Tool::Shape).expect("shape").font_family = "Inter".to_owned();
+        assert_eq!(
+            styles.get(Tool::Text).expect("text").font_family,
+            snp_ligase_core::text::DEFAULT_FAMILY
+        );
+
+        assert!(styles.adopt_default_family("Noto Sans"));
+
+        for tool in Tool::ALL {
+            let Some(style) = styles.get(tool) else {
+                continue;
+            };
+            let expected = if tool == Tool::Shape {
+                "Inter"
+            } else {
+                "Noto Sans"
+            };
+            assert_eq!(style.font_family, expected, "{tool:?}");
+        }
+    }
+
+    /// Windows: the loaded default *is* SPEC 7.5's name, so nothing changes.
+    #[test]
+    fn adopting_the_windows_default_changes_nothing() {
+        let mut styles = ToolStyles::default();
+
+        assert!(!styles.adopt_default_family(snp_ligase_core::text::DEFAULT_FAMILY));
+
+        assert_eq!(
+            styles.get(Tool::Text).expect("text").font_family,
+            snp_ligase_core::text::DEFAULT_FAMILY
+        );
     }
 
     #[test]

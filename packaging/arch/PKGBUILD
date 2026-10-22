@@ -1,0 +1,62 @@
+# Builds the snpl package for Arch Linux (and derivatives such as EndeavourOS)
+# from this repository's checkout, not from a download:
+#
+#   cd packaging/arch && SNPL_SRC="$(git rev-parse --show-toplevel)" makepkg -f
+#
+# The release workflow runs exactly this in an archlinux container.
+# Install the result with:  sudo pacman -U snpl-<version>-1-x86_64.pkg.tar.zst
+#
+# The program is /usr/bin/snpl. The menu entry, its icon and the app id stay
+# `snp-ligase`: KDE ties the screenshot permission and the global shortcuts to
+# that id, and grants KWin's native capture to the `Exec` path in the entry.
+
+pkgname=snpl
+pkgver=0.3.0
+pkgrel=1
+pkgdesc='Screenshot and annotation tool (snp-ligase)'
+arch=('x86_64')
+url='https://github.com/SirToffski/snpl-releases'
+license=('MIT')
+# Linked: libX11, libX11-xcb. Loaded at run time: xkbcommon (and its X11
+# part), Wayland, EGL or Vulkan for drawing, libxcb, Xcursor, Xi, D-Bus.
+depends=('gcc-libs' 'glibc' 'libx11' 'libxcb' 'libxcursor' 'libxi'
+         'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libglvnd'
+         'vulkan-icd-loader' 'dbus' 'hicolor-icon-theme')
+makedepends=('cargo')
+optdepends=('xdg-desktop-portal: screenshots and global shortcuts on Wayland'
+            'xdg-desktop-portal-kde: the portal backend for KDE Plasma'
+            'xdg-desktop-portal-wlr: the portal backend for wlroots compositors')
+# Cargo's release profile already does LTO and stripping.
+options=('!lto' '!debug')
+
+build() {
+    cd "${SNPL_SRC:?set SNPL_SRC to the repository root}"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo build --release --locked -p snp-ligase-app
+}
+
+check() {
+    cd "$SNPL_SRC"
+    export CARGO_TARGET_DIR="$srcdir/target"
+    cargo test --workspace --locked
+}
+
+package() {
+    cd "$SNPL_SRC"
+    install -Dm755 "$srcdir/target/release/snpl" "$pkgdir/usr/bin/snpl"
+
+    install -dm755 "$pkgdir/usr/share/applications"
+    sed 's|@BINDIR@/snp-ligase|/usr/bin/snpl|g' packaging/linux/snp-ligase.desktop \
+        > "$pkgdir/usr/share/applications/snp-ligase.desktop"
+    if grep -q '@' "$pkgdir/usr/share/applications/snp-ligase.desktop"; then
+        echo "the menu entry still has a placeholder" >&2
+        return 1
+    fi
+
+    install -Dm644 crates/snp-ligase-app/assets/snpl-256.png \
+        "$pkgdir/usr/share/icons/hicolor/256x256/apps/snp-ligase.png"
+    install -Dm644 crates/snp-ligase-app/assets/snpl-32.png \
+        "$pkgdir/usr/share/icons/hicolor/32x32/apps/snp-ligase.png"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 packaging/linux/CHECKLIST.md "$pkgdir/usr/share/doc/$pkgname/CHECKLIST.md"
+}

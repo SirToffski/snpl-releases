@@ -14,7 +14,7 @@ use std::path::Path;
 use image::{ExtendedColorType, ImageEncoder as _, RgbaImage, codecs::png::PngEncoder};
 use serde::Serialize;
 use snp_ligase_platform::{
-    CaptureOptions, FrameDiagnostics, MonitorInfo, Platform, WindowsPlatform,
+    CaptureOptions, CurrentPlatform, FrameDiagnostics, MonitorInfo, Platform, PlatformEnvironment,
 };
 
 /// The `capture.json` document: one entry per monitor.
@@ -22,6 +22,10 @@ use snp_ligase_platform::{
 struct CaptureReport {
     /// Program version that produced the capture.
     version: &'static str,
+    /// Which backend answered, on which session, in which desktop
+    /// (LINUX_SUPPORT.md sections 4 and 10): the first thing a Linux bug
+    /// report is read for.
+    platform: PlatformEnvironment,
     /// The options the capture ran with.
     options: CaptureOptions,
     /// One entry per monitor, in enumeration order.
@@ -41,11 +45,33 @@ struct MonitorReport {
 
 /// Captures every monitor and writes the report.
 ///
+/// The folders the program writes to are printed and logged first
+/// (LINUX_SUPPORT.md section 3, item 4): this command is the one that is run on
+/// a machine whose GUI cannot be used, and on a platform where the capture is
+/// not there yet it is the only thing it can answer.
+///
 /// # Errors
 ///
 /// If the directory cannot be created or written, or the capture itself fails.
-pub fn run(directory: &Path) -> anyhow::Result<()> {
-    let platform = WindowsPlatform::new();
+pub fn run(directory: &Path, paths: &crate::paths::Paths) -> anyhow::Result<()> {
+    let platform = CurrentPlatform::new();
+    let environment = platform.environment();
+
+    println!("{}", paths.summary());
+    println!(
+        "platform: backend {}, session {}, desktop {}",
+        environment.backend,
+        environment.session_type.as_deref().unwrap_or("-"),
+        environment.desktop.as_deref().unwrap_or("-"),
+    );
+    tracing::info!(
+        config_dir = %paths.config_dir.display(),
+        log_dir = %paths.log_dir.display(),
+        backend = environment.backend,
+        session_type = environment.session_type.as_deref().unwrap_or("-"),
+        desktop = environment.desktop.as_deref().unwrap_or("-"),
+        "debug capture"
+    );
 
     let monitors = platform.monitors()?;
     print_monitors(&monitors);
@@ -91,6 +117,7 @@ pub fn run(directory: &Path) -> anyhow::Result<()> {
 
     let report = CaptureReport {
         version: env!("CARGO_PKG_VERSION"),
+        platform: environment,
         options: CaptureOptions::default(),
         monitors: reports,
     };
@@ -160,6 +187,11 @@ mod tests {
     fn the_report_serialises() {
         let report = CaptureReport {
             version: "0.1.0",
+            platform: PlatformEnvironment {
+                backend: "x11",
+                session_type: Some("x11".to_owned()),
+                desktop: Some("XFCE".to_owned()),
+            },
             options: CaptureOptions::default(),
             monitors: vec![MonitorReport {
                 index: 0,
@@ -194,5 +226,10 @@ mod tests {
         assert!(json.contains("monitor_0.png"), "{json}");
         assert!(json.contains("\"hdr_active\":false"), "{json}");
         assert!(json.contains("\"api_used\":\"WGC\""), "{json}");
+        // LINUX_SUPPORT.md section 4: which backend and which session produced
+        // the capture is the first line of a Linux bug report.
+        assert!(json.contains("\"backend\":\"x11\""), "{json}");
+        assert!(json.contains("\"session_type\":\"x11\""), "{json}");
+        assert!(json.contains("\"desktop\":\"XFCE\""), "{json}");
     }
 }

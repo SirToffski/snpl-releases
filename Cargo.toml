@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -22,6 +22,11 @@ snp-ligase-platform = { path = "crates/snp-ligase-platform" }
 # GUI.
 eframe = "0.36.2"
 egui = "0.36.2"
+# The X11 overlay child's window and pixel blitting (LINUX_SUPPORT.md L1b).
+# The version is the one eframe 0.36.2 resolves, so the whole workspace uses
+# one winit. softbuffer is MIT OR Apache-2.0, like winit (DECISIONS.md).
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11"] }
+softbuffer = { version = "0.4.8", default-features = false, features = ["x11"] }
 
 # 2D rasterizer (CPU, anti-aliased paths).
 tiny-skia = "0.12.0"
@@ -58,6 +63,35 @@ serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
 directories = "6.0.0"
 chrono = "0.4.45"
+
+# Unix system calls: geteuid for the instance channel's fallback directory, and
+# the System V shared memory the X11 capture's MIT-SHM path uses.
+libc = "0.2.190"
+# X11 protocol bindings for the Linux backend (LINUX_SUPPORT.md section 8).
+# MIT OR Apache-2.0. The features are chosen per crate, not least because
+# another crate's features must never be what makes ours compile.
+x11rb = "0.13.2"
+
+# XDG desktop portals for the KDE Wayland backend (LINUX_SUPPORT.md section 8).
+# ashpd is MIT; its async-io backend runs on async-io (Apache-2.0 OR MIT).
+# Normal Linux dependencies since the L3b backend (S1: the Screenshot portal).
+ashpd = { version = "0.13.13", default-features = false, features = [
+    "async-io",
+    "global_shortcuts",
+    "screenshot",
+] }
+async-io = "2.6.0"
+futures-lite = "2.6.1"
+
+# The Wayland output layout probe (LINUX_SUPPORT.md section 6, L3b): the
+# output's logical position/size and its physical mode, which winit reports
+# wrong for mixed-scale desktops. wayland-client is MIT; wayland-protocols is
+# MIT and carries xdg_output behind its `unstable` feature.
+wayland-client = "0.31.15"
+wayland-protocols = { version = "0.32.13", default-features = false, features = [
+    "client",
+    "unstable",
+] }
 
 # Errors and logging.
 thiserror = "2.0.21"

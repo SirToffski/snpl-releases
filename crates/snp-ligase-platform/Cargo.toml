@@ -24,6 +24,9 @@ serde = { workspace = true, features = ["derive"] }
 image = { workspace = true, default-features = false }
 thiserror.workspace = true
 
+# Windows-only dependencies. Any non-Windows target must configure without
+# them (LINUX_SUPPORT.md section 3, item 1).
+[target.'cfg(windows)'.dependencies]
 # Windows APIs. Only the features actually used are enabled. All of the `windows`
 # crate usage in the project lives in this crate (SPEC section 0, rule 7).
 windows = { workspace = true, features = [
@@ -40,7 +43,52 @@ windows = { workspace = true, features = [
     "Win32_System_SystemInformation", # GetTickCount64 for the self-check's idle guard
     "Win32_System_Threading",       # CreateMutexW, AttachThreadInput
     "Win32_Security",               # SECURITY_ATTRIBUTES for CreateMutexW
+    "Win32_System_Registry",        # the per-user Run key for "Start with Windows"
 ] }
 
 # Windows.Graphics.Capture wrapper (SPEC section 3).
 windows-capture.workspace = true
+
+# Unix-only dependencies.
+[target.'cfg(unix)'.dependencies]
+# The instance channel's per-user fallback directory needs the process's user
+# id (L1a carry-over 1 from the L0d review), and the X11 capture needs the
+# System V shared memory segment MIT-SHM is built on. MIT OR Apache-2.0.
+libc.workspace = true
+
+# The X11 backend (LINUX_SUPPORT.md phase L1): RandR monitor enumeration,
+# MIT-SHM and plain GetImage capture, XQueryPointer and the EWMH properties;
+# XTest for the overlay self-check's injected input, and MIT-SCREEN-SAVER for
+# its idle guard. MIT OR Apache-2.0.
+[target.'cfg(target_os = "linux")'.dependencies]
+# The X11 backend (LINUX_SUPPORT.md phase L1): RandR monitor enumeration,
+# MIT-SHM and plain GetImage capture, XQueryPointer and the EWMH properties;
+# XTest for the overlay self-check's injected input, and MIT-SCREEN-SAVER for
+# its idle guard. MIT OR Apache-2.0.
+x11rb = { workspace = true, features = ["randr", "shm", "xtest", "screensaver"] }
+# The overlay children's windows and pixel blitting (L1b on X11, L3b on
+# Wayland). Both Wayland and X11 are enabled so one build covers both
+# sessions; winit picks the display from the session's environment variables.
+# winit is the same version eframe resolves; softbuffer is MIT OR Apache-2.0
+# (DECISIONS.md).
+winit = { workspace = true, features = ["wayland"] }
+softbuffer = { workspace = true, features = ["wayland"] }
+# The overlay layout and the child's answer, one JSON document each way.
+serde_json = "1.0"
+# The Wayland portals (LINUX_SUPPORT.md section 6, L3b/L3c): Screenshot
+# and GlobalShortcuts, driven on their own threads with async-io. ashpd is MIT;
+# async-io is Apache-2.0 OR MIT; futures-lite is Apache-2.0 OR MIT.
+ashpd.workspace = true
+async-io.workspace = true
+futures-lite.workspace = true
+# The Wayland output layout probe (LINUX_SUPPORT.md section 6, L3b):
+# `xdg_output`'s logical position/size and `wl_output`'s physical mode, which
+# winit reports wrongly for mixed-scale desktops (S1/S2). Both MIT.
+wayland-client = { workspace = true, features = ["system"] }
+wayland-protocols = { workspace = true, features = ["staging"] }
+# Decoding the Screenshot portal's PNG frames (L3b). Same crate, one more
+# codec, Linux only because only the portal needs it.
+image = { workspace = true, default-features = false, features = ["png"] }
+
+# Local Screenshot URI decoding (W1); already transitive, MIT OR Apache-2.0.
+url = "2.5.8"

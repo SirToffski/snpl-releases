@@ -4,6 +4,7 @@
 //! crates, `unsafe`, Win32 handles. Nothing outside this module knows any of
 //! that (SPEC section 0, rule 7).
 
+pub mod autostart;
 pub mod capture;
 pub mod keys;
 pub mod monitors;
@@ -42,6 +43,14 @@ impl WindowsPlatform {
 }
 
 impl Platform for WindowsPlatform {
+    fn capabilities(&self) -> crate::Capabilities {
+        crate::Capabilities::FULL
+    }
+
+    fn environment(&self) -> crate::PlatformEnvironment {
+        crate::PlatformEnvironment::WINDOWS
+    }
+
     fn monitors(&self) -> Result<Vec<MonitorInfo>> {
         let raw = monitors::enumerate()?;
         monitors::details(&raw)
@@ -90,5 +99,30 @@ impl Platform for WindowsPlatform {
 
     fn cursor_pos(&self) -> Result<(i32, i32)> {
         window_info::cursor_pos()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Capabilities, HotkeySupport};
+
+    #[test]
+    fn windows_reports_what_it_has_today() {
+        // LINUX_SUPPORT.md section 3, item 2: `WindowsPlatform` reports what
+        // it has today, and this is the one list that says so.
+        let capabilities = WindowsPlatform::new().capabilities();
+        assert!(capabilities.silent_capture, "capture");
+        assert!(capabilities.overlay, "overlay");
+        assert!(capabilities.active_window_rect, "active window");
+        assert!(capabilities.cursor_position, "cursor");
+        assert!(capabilities.hide_main_window, "hide window");
+        assert_eq!(
+            capabilities.global_hotkeys,
+            HotkeySupport::Native,
+            "hotkeys"
+        );
+        assert!(capabilities.tray, "tray");
+        assert_eq!(capabilities, Capabilities::FULL);
     }
 }

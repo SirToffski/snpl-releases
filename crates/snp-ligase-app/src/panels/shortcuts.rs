@@ -1,7 +1,7 @@
 //! The Keyboard Shortcuts window (SPEC 8.3's Help > Keyboard Shortcuts).
 //!
-//! The rows are built by [`crate::shortcuts::help_rows`], which takes the tool
-//! keys from the tool list and the capture keys from the user's settings, so
+//! The rows are built by [`crate::shortcuts::help_rows_for`], which takes the tool
+//! keys from the tool list and the capture keys from the backend binding model, so
 //! this window cannot list a key the app does not have. Like every other panel
 //! it only draws: the flag it is given is what closes it.
 

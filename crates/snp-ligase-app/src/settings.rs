@@ -132,6 +132,11 @@ pub struct Settings {
     // -- Editor.
     /// Ask before closing tabs with unsaved changes (default on).
     pub ask_before_closing: bool,
+    /// Ask "Quit snp-ligase?" before quitting on a platform with no tray icon,
+    /// where the window's X is the only way out (LINUX_SUPPORT.md section 3,
+    /// item 8; default on). The prompt's "Don't ask again" writes this, and
+    /// Settings > Editor shows it.
+    pub ask_before_quitting: bool,
     /// Switch to the Select tool after drawing an annotation (default off).
     pub switch_to_select_after_drawing: bool,
     /// Show each tool's name next to its key (default on).
@@ -179,6 +184,7 @@ impl Default for Settings {
             avif_speed: 6,
             jxl_distance: 1.0,
             ask_before_closing: true,
+            ask_before_quitting: true,
             switch_to_select_after_drawing: false,
             show_tool_labels: true,
             auto_fit_to_window: true,
@@ -386,10 +392,16 @@ fn default_save_folder() -> PathBuf {
 /// words, because they are shown in the Settings dialog:
 ///
 /// - the format string itself is valid (a bare `%`, an unknown `%Q`);
-/// - every folder name in the result is a legal Windows one — no `< > : " / \
-///   | ? *`, no control characters, no trailing dot or space, and not empty;
+/// - every folder name in the result passes one conservative cross-platform
+///   check — the Windows forbidden set `< > : " / \ | ? *`, no control
+///   characters, no trailing dot or space, not empty — so a folder that works
+///   on one platform also works on the other;
 /// - a drive or absolute prefix is kept where it was written, which is where a
 ///   literal one belongs (an expanded segment may not introduce one).
+///
+/// Both `/` and `\` are treated as separators, and the prefix separator is the
+/// platform's own, so `/home/me/Shots/%Y-%m` works on Linux the way
+/// `C:\Shots\%Y-%m` does on Windows.
 pub fn resolve_save_folder(folder: &Path, now: DateTime<Local>) -> Result<PathBuf, String> {
     let text = folder.to_string_lossy();
     if text.trim().is_empty() {
@@ -418,7 +430,9 @@ pub fn resolve_save_folder(folder: &Path, now: DateTime<Local>) -> Result<PathBu
     let rooted = tail.starts_with(['\\', '/']);
     let tail = if rooted { &tail[1..] } else { tail };
     if rooted {
-        resolved.push("\\");
+        // The platform's own separator: pushing `/` on Linux reaches the file
+        // system root, pushing `\` on Windows appends to the drive/UNC prefix.
+        resolved.push(std::path::MAIN_SEPARATOR_STR);
     }
     // A single trailing separator is conventional for a folder and is allowed,
     // as are drive/UNC roots. Interior empty names are still rejected.
@@ -444,10 +458,12 @@ pub fn resolve_save_folder(folder: &Path, now: DateTime<Local>) -> Result<PathBu
     Ok(resolved)
 }
 
-/// Whether one folder name is legal on Windows (the same rule
-/// [`file_name_from_template`] applies to a file name).
+/// Whether one folder name passes the conservative cross-platform check (the
+/// same rule [`file_name_from_template`] applies to a file name).
 fn check_path_segment(segment: &str) -> Result<(), String> {
-    // The characters Windows forbids in a path, plus the control range.
+    // The characters Windows forbids in a path, plus the control range. Used
+    // on every platform, so a folder name is never a surprise when the same
+    // config is used on Windows.
     const FORBIDDEN: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
     if let Some(bad) = segment
         .chars()
@@ -806,6 +822,17 @@ mod tests {
             .expect("a valid local time")
     }
 
+    /// A save-folder root in this platform's shape, so the folder tests check
+    /// the same behaviour on Windows (`C:\Shots`) and Linux (`/tmp/Shots`)
+    /// without a second copy of every test.
+    fn test_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Shots")
+        } else {
+            PathBuf::from("/tmp/Shots")
+        }
+    }
+
     #[test]
     fn a_missing_file_is_the_defaults_without_complaint() {
         let folder = temp_dir("missing");
@@ -920,6 +947,27 @@ mod tests {
         assert!(
             store.settings().auto_fit_to_window,
             "auto-fit is not the default"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// LINUX_SUPPORT.md section 3, item 8: the quit confirmation's row is
+    /// serde-defaulted too, so a config file written before it existed still
+    /// loads, with the question on.
+    #[test]
+    fn a_config_without_the_ask_before_quitting_row_still_loads() {
+        let folder = temp_dir("old-quit-confirm");
+        std::fs::write(
+            folder.join(CONFIG_FILE),
+            "include_cursor = true\njpeg_quality = 77\n",
+        )
+        .expect("the test file should be writable");
+
+        let (store, warnings) = SettingsStore::load(folder.clone());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(
+            store.settings().ask_before_quitting,
+            "the quit confirmation is not the default"
         );
         let _ = std::fs::remove_dir_all(&folder);
     }
@@ -1173,19 +1221,32 @@ mod tests {
     /// `%Y-%m` in the default folder resolves to the month it names.
     #[test]
     fn a_dated_folder_resolves_to_that_month() {
-        let folder = Path::new("C:\\Shots\\%Y-%m");
-        let resolved = resolve_save_folder(folder, fixed_time()).expect("valid");
-        assert_eq!(resolved, PathBuf::from("C:\\Shots\\2026-10"));
+        let root = test_root();
+        let folder = root.join("%Y-%m");
+        let resolved = resolve_save_folder(&folder, fixed_time()).expect("valid");
+        assert_eq!(resolved, root.join("2026-10"));
     }
 
     #[test]
     fn folder_validation_checks_segments_before_path_normalization() {
-        for template in [
+        // An interior empty segment, a separator an expansion introduced, and
+        // a dynamic prefix are all refused before `Path::components()` can
+        // quietly fold them away.
+        #[cfg(windows)]
+        let bad = [
             r"C:\Shots\\%Y",
             r"C:\Shots\%D",
             r"C:\Shots\%x",
             r"\\server\%Y\Shots",
-        ] {
+        ];
+        #[cfg(not(windows))]
+        let bad = [
+            "/tmp/Shots//%Y",
+            "/tmp/Shots/%D",
+            "/tmp/Shots/%x",
+            "//server/%Y/Shots",
+        ];
+        for template in bad {
             assert!(
                 resolve_save_folder(Path::new(template), fixed_time()).is_err(),
                 "accepted an empty segment, generated separator, or dynamic prefix: {template}"
@@ -1193,6 +1254,10 @@ mod tests {
         }
     }
 
+    /// Drive letters and UNC prefixes are Windows path shape; the `Literal`
+    /// prefix rule is the same code on both platforms (the Linux roots are
+    /// checked below).
+    #[cfg(windows)]
     #[test]
     fn literal_roots_and_unc_prefixes_are_valid_save_folders() {
         for template in [r"C:\", r"\\server\share\", r"C:\Shots\%Y\"] {
@@ -1203,73 +1268,93 @@ mod tests {
         }
     }
 
+    /// The Linux twin: `/` and a folder under it are kept where they were
+    /// written.
+    #[cfg(not(windows))]
+    #[test]
+    fn absolute_roots_are_valid_save_folders() {
+        for template in ["/", "/tmp/%Y/"] {
+            assert!(
+                resolve_save_folder(Path::new(template), fixed_time()).is_ok(),
+                "{template}"
+            );
+        }
+    }
+
     /// A couple of the other date variables, in a nested folder.
     #[test]
     fn dated_folders_can_nest() {
-        let folder = Path::new("%Y\\%m-%d");
-        let resolved = resolve_save_folder(folder, fixed_time()).expect("valid");
-        assert_eq!(resolved, PathBuf::from("2026\\10-12"));
+        let folder = Path::new("%Y").join("%m-%d");
+        let resolved = resolve_save_folder(&folder, fixed_time()).expect("valid");
+        assert_eq!(resolved, Path::new("2026").join("10-12"));
     }
 
     /// `%%` stays a literal percent sign, so a folder that really has one in
     /// its name can be written.
     #[test]
     fn a_doubled_percent_is_a_literal_one() {
-        let folder = Path::new("C:\\100%% done\\%Y");
-        let resolved = resolve_save_folder(folder, fixed_time()).expect("valid");
-        assert_eq!(resolved, PathBuf::from("C:\\100% done\\2026"));
+        let root = test_root();
+        let folder = root.join("100%% done").join("%Y");
+        let resolved = resolve_save_folder(&folder, fixed_time()).expect("valid");
+        assert_eq!(resolved, root.join("100% done").join("2026"));
     }
 
     /// A folder with no `%` in it is unchanged.
     #[test]
     fn a_plain_folder_is_left_alone() {
-        let folder = Path::new("C:\\Shots");
-        let resolved = resolve_save_folder(folder, fixed_time()).expect("valid");
+        let folder = test_root();
+        let resolved = resolve_save_folder(&folder, fixed_time()).expect("valid");
         assert_eq!(resolved, folder);
     }
 
     /// What is refused, and the words used for it.
     #[test]
     fn a_broken_folder_is_refused_with_a_reason() {
+        let root = test_root();
         // An unknown conversion.
-        let error = resolve_save_folder(Path::new("C:\\%Q"), fixed_time()).expect_err("bad");
+        let error = resolve_save_folder(&root.join("%Q"), fixed_time()).expect_err("bad");
         assert!(error.contains("invalid"), "{error}");
-        // A bare percent sign, at the end or in the middle.
-        assert!(resolve_save_folder(Path::new("C:\\Shots\\%"), fixed_time()).is_err());
-        assert!(resolve_save_folder(Path::new("C:\\%"), fixed_time()).is_err());
+        // A bare percent sign, as the last name or in the middle.
+        assert!(resolve_save_folder(&root.join("%"), fixed_time()).is_err());
+        assert!(
+            resolve_save_folder(&root.join("%").join("More"), fixed_time()).is_err(),
+            "a bare percent in the middle was accepted"
+        );
         // Empty.
         assert!(resolve_save_folder(Path::new(""), fixed_time()).is_err());
         assert!(resolve_save_folder(Path::new("   "), fixed_time()).is_err());
-        // Characters Windows forbids, whether written or expanded.
-        for bad in [
-            "C:\\Shots<>",
-            "C:\\Shots:",
-            "C:\\Shots|",
-            "C:\\Shots?",
-            "C:\\Shots*",
-        ] {
-            let error = resolve_save_folder(Path::new(bad), fixed_time()).expect_err("bad");
+        // Characters Windows forbids, whether written or expanded. The check
+        // is applied on every platform, so this holds on Linux too.
+        for bad in ["Shots<>", "Shots:", "Shots|", "Shots?", "Shots*"] {
+            let error = resolve_save_folder(&root.join(bad), fixed_time()).expect_err("bad");
             assert!(
                 error.contains("folder name"),
                 "{bad} gave the wrong reason: {error}"
             );
         }
-        // An empty segment.
-        let error =
-            resolve_save_folder(Path::new("C:\\\\"), fixed_time()).expect_err("empty segment");
+        // An empty segment in the middle.
+        let error = resolve_save_folder(
+            &PathBuf::from(format!("{}//", root.display())),
+            fixed_time(),
+        )
+        .expect_err("empty segment");
         assert!(
             error.contains("empty") || error.contains("no folder name"),
             "{error}"
         );
-        // A trailing dot or space, which Windows drops silently.
-        assert!(resolve_save_folder(Path::new("C:\\Shots."), fixed_time()).is_err());
-        assert!(resolve_save_folder(Path::new("C:\\Shots "), fixed_time()).is_err());
+        // A trailing dot or space, which Windows drops silently; refused
+        // everywhere so a name cannot mean something different there.
+        assert!(resolve_save_folder(&root.join("Shots."), fixed_time()).is_err());
+        assert!(resolve_save_folder(&root.join("Shots "), fixed_time()).is_err());
         // A parent directory is not a save folder.
-        assert!(resolve_save_folder(Path::new("..\\%Y"), fixed_time()).is_err());
+        assert!(resolve_save_folder(&Path::new("..").join("%Y"), fixed_time()).is_err());
     }
 
     /// A drive prefix is only accepted where it was written: an expanded
-    /// segment may not introduce one (it would hold a colon).
+    /// segment may not introduce one (it would hold a colon). Drive letters
+    /// are Windows path shape; the same rule on Linux would refuse a colon in
+    /// any expanded name, already covered above.
+    #[cfg(windows)]
     #[test]
     fn a_drive_prefix_stays_where_it_was_written() {
         let resolved = resolve_save_folder(Path::new("%Y"), fixed_time()).expect("valid");
@@ -1284,7 +1369,7 @@ mod tests {
     #[test]
     fn an_unusable_folder_is_reported_and_uses_the_default() {
         let settings = Settings {
-            save_folder: Some(PathBuf::from("C:\\Shots\\%Q")),
+            save_folder: Some(test_root().join("%Q")),
             ..Settings::default()
         };
 
@@ -1303,8 +1388,9 @@ mod tests {
     /// folder with the next month's name.
     #[test]
     fn the_folder_and_the_name_use_the_same_instant() {
+        let root = test_root();
         let settings = Settings {
-            save_folder: Some(PathBuf::from("C:\\Shots\\%Y-%m")),
+            save_folder: Some(root.join("%Y-%m")),
             ..Settings::default()
         };
         let moment = Local
@@ -1315,27 +1401,22 @@ mod tests {
 
         let (path, warnings) = settings.save_path_at(moment);
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(
-            path,
-            PathBuf::from("C:\\Shots\\2026-10\\snap_20261031-235959.png")
-        );
+        assert_eq!(path, root.join("2026-10").join("snap_20261031-235959.png"));
     }
 
     /// The live preview line the Settings dialog shows.
     #[test]
     fn the_preview_names_the_full_path_of_a_capture_saved_now() {
+        let root = test_root();
         let settings = Settings {
-            save_folder: Some(PathBuf::from("C:\\Shots\\%Y-%m")),
+            save_folder: Some(root.join("%Y-%m")),
             default_format: "jpg".to_owned(),
             ..Settings::default()
         };
 
         let (path, warnings) = settings.save_path_at(fixed_time());
         assert!(warnings.is_empty(), "{warnings:?}");
-        assert_eq!(
-            path,
-            PathBuf::from("C:\\Shots\\2026-10\\snap_20261012-153045.jpg")
-        );
+        assert_eq!(path, root.join("2026-10").join("snap_20261012-153045.jpg"));
     }
 
     /// `Browse…` writes the folder it picked with every `%` doubled, so a

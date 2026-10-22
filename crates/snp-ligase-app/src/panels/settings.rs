@@ -11,27 +11,49 @@
 use egui::Ui;
 use snp_ligase_core::codec::Format;
 use snp_ligase_core::model::Rgba;
-use snp_ligase_platform::HdrHighlights;
+use snp_ligase_platform::{Capabilities, HdrHighlights, HotkeySupport};
 
 use crate::hotkeys::{HOTKEY_MODES, default_hotkey_strings, display_hotkey, parse_hotkey};
 use crate::panels::colour;
-use crate::panels::{Action, CaptureMode};
+use crate::panels::{Action, CaptureMode, HIDE_WINDOW_UNAVAILABLE, HOTKEYS_UNAVAILABLE};
 use crate::settings::{ExpansionFill, Settings};
 
-/// Draws the dialog. `draft` is edited in place; `config_path` is shown in the
-/// Advanced section so the human can find the file. `recording` is the mode
-/// whose hotkey is being recorded right now, if any; `warnings` are the
-/// registration failures from the last "Test" (NEXT_STEPS step 7). `recent` is
-/// the app's recent-colour list, shared with the properties panel (SPEC 8.4).
+/// Everything the dialog only reads: where the settings file lives, which
+/// hotkey is being recorded, what the platform can do, and the registration
+/// warnings from the last "Test".
+///
+/// A struct rather than four more arguments, like the properties panel's
+/// [`crate::panels::properties::PanelContext`].
+pub struct SettingsContext<'a> {
+    /// The settings file, shown in the Advanced section so the human can find
+    /// it.
+    pub config_path: &'a std::path::Path,
+    /// The mode whose hotkey is being recorded right now, if any.
+    pub recording: Option<CaptureMode>,
+    /// What the platform backend can really do (LINUX_SUPPORT.md section 3,
+    /// item 2): controls it cannot honour are disabled with the reason in their
+    /// hover text.
+    pub capabilities: &'a Capabilities,
+    /// The registration failures from the last "Test" (NEXT_STEPS step 7).
+    pub warnings: &'a [String],
+}
+
+/// Draws the dialog. `draft` is edited in place; the rest is read from
+/// `context`, except `recent`, the app's recent-colour list shared with the
+/// properties panel (SPEC 8.4).
 pub fn show(
     ui: &mut Ui,
     draft: &mut Settings,
-    config_path: &std::path::Path,
-    recording: Option<CaptureMode>,
-    warnings: &[String],
+    context: SettingsContext<'_>,
     recent: &mut Vec<Rgba>,
     actions: &mut Vec<Action>,
 ) {
+    let SettingsContext {
+        config_path,
+        recording,
+        capabilities,
+        warnings,
+    } = context;
     let mut open = true;
     egui::Window::new("Settings")
         .collapsible(false)
@@ -42,13 +64,13 @@ pub fn show(
             egui::ScrollArea::vertical()
                 .max_height(520.0)
                 .show(ui, |ui| {
-                    capture(ui, draft);
+                    capture(ui, draft, capabilities);
                     ui.add_space(8.0);
                     saving(ui, draft, recent, actions);
                     ui.add_space(8.0);
-                    hotkeys(ui, draft, recording, warnings, actions);
+                    hotkeys(ui, draft, recording, capabilities, warnings, actions);
                     ui.add_space(8.0);
-                    editor(ui, draft);
+                    editor(ui, draft, capabilities);
                     ui.add_space(8.0);
                     advanced(ui, draft, config_path);
                 });
@@ -69,18 +91,38 @@ pub fn show(
 }
 
 /// Capture (SPEC 10's first four rows).
-fn capture(ui: &mut Ui, draft: &mut Settings) {
+///
+/// The two options that need the OS are disabled with the reason when the
+/// platform cannot honour them (LINUX_SUPPORT.md section 3, item 2): hiding
+/// the window, and reading the cursor.
+fn capture(ui: &mut Ui, draft: &mut Settings, capabilities: &Capabilities) {
     ui.heading("Capture");
     ui.separator();
-    ui.checkbox(
-        &mut draft.hide_while_capturing,
-        "Hide snp-ligase while capturing",
-    )
-    .on_hover_text("The window is hidden before the screenshot, so it is not in the image.");
-    ui.checkbox(
-        &mut draft.include_cursor,
-        "Include the mouse cursor in captures",
+    let hide = ui.add_enabled(
+        capabilities.hide_main_window,
+        egui::Checkbox::new(
+            &mut draft.hide_while_capturing,
+            "Hide snp-ligase while capturing",
+        ),
     );
+    if capabilities.hide_main_window {
+        hide.on_hover_text(
+            "The window is hidden before the screenshot, so it is not in the image.",
+        );
+    } else {
+        hide.on_disabled_hover_text(HIDE_WINDOW_UNAVAILABLE);
+    }
+
+    let cursor = ui.add_enabled(
+        capabilities.capture_cursor,
+        egui::Checkbox::new(
+            &mut draft.include_cursor,
+            "Include the mouse cursor in captures",
+        ),
+    );
+    if !capabilities.capture_cursor {
+        cursor.on_disabled_hover_text("This capture backend cannot include cursor pixels. Windows and KDE native capture support this option.");
+    }
 
     ui.horizontal(|ui| {
         ui.label("HDR highlights");
@@ -272,22 +314,105 @@ fn saving(ui: &mut Ui, draft: &mut Settings, recent: &mut Vec<Rgba>, actions: &m
     }
 }
 
+/// The program's own name for the CLI commands Settings offers to copy.
+///
+/// It is the running executable's file name, not a fixed string: the dev
+/// build is `snp-ligase`, the released packages install `snpl`, and a
+/// command that names the wrong binary does nothing when bound. Tests run
+/// from the test harness, so they see the dev name.
+fn command_name() -> String {
+    if cfg!(test) {
+        return crate::APP_NAME.to_owned();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| crate::APP_NAME.to_owned())
+}
+
 /// Hotkeys (SPEC 10's "Hotkeys for the four capture modes", with conflicts).
 ///
 /// Each row has a "Record…" button (NEXT_STEPS step 7): while `recording` is
 /// that mode the field is replaced by a label that says to press the keys, so
 /// nothing can type into it and the recorder owns the keyboard.
+///
+/// Without a global-hotkey backend the whole section is disabled, with the
+/// reason as a visible line above it and in its hover text
+/// (LINUX_SUPPORT.md section 3, item 2).
 fn hotkeys(
+    ui: &mut Ui,
+    draft: &mut Settings,
+    recording: Option<CaptureMode>,
+    capabilities: &Capabilities,
+    warnings: &[String],
+    actions: &mut Vec<Action>,
+) {
+    ui.heading("Hotkeys");
+    ui.separator();
+    if capabilities.global_hotkeys == HotkeySupport::Portal {
+        ui.label(
+            "Change shortcuts in System Settings > Shortcuts. The desktop owns these bindings.",
+        );
+        for (mode, trigger) in
+            crate::shortcuts::capture_bindings(draft, capabilities.global_hotkeys)
+        {
+            let trigger = if trigger.is_empty() {
+                "Not bound"
+            } else {
+                &trigger
+            };
+            ui.label(format!("{}: {trigger}", mode.label()));
+        }
+        ui.label("You can also assign these commands in your desktop's shortcut settings:");
+        if !capabilities.compositor_targets {
+            ui.label("Current Monitor and Active Window are unavailable: this Wayland desktop has no native capture targets.");
+        } else {
+            ui.label("Current Monitor follows the pointer. Bind it and Active Window in System Settings > Shortcuts.");
+        }
+        for mode in CaptureMode::ALL
+            .into_iter()
+            .filter(|mode| mode.blocked(capabilities).is_none())
+        {
+            let mode = crate::hotkeys::portal_id(mode);
+            let command = format!("{} --capture {mode}", command_name());
+            ui.horizontal(|ui| {
+                ui.monospace(&command);
+                if ui.button("Copy command").clicked() {
+                    ui.ctx().copy_text(command);
+                }
+            });
+        }
+        for warning in warnings {
+            ui.label(warning);
+        }
+        return;
+    }
+
+    ui.label("Type a combination like Ctrl+Shift+P, or leave a field empty for no hotkey.");
+    let can_bind = capabilities.global_hotkeys != HotkeySupport::None;
+    if !can_bind {
+        ui.label(HOTKEYS_UNAVAILABLE);
+    }
+    let section = ui.add_enabled_ui(can_bind, |ui| {
+        hotkey_rows(ui, draft, recording, warnings, actions);
+    });
+    if !can_bind {
+        section.response.on_disabled_hover_text(HOTKEYS_UNAVAILABLE);
+    }
+}
+
+/// The fields, buttons and messages of the Hotkeys section.
+fn hotkey_rows(
     ui: &mut Ui,
     draft: &mut Settings,
     recording: Option<CaptureMode>,
     warnings: &[String],
     actions: &mut Vec<Action>,
 ) {
-    ui.heading("Hotkeys");
-    ui.separator();
-    ui.label("Type a combination like Ctrl+Shift+P, or leave a field empty for no hotkey.");
-
     for mode in HOTKEY_MODES {
         ui.horizontal(|ui| {
             ui.label(mode.label());
@@ -370,13 +495,27 @@ fn hotkeys(
 }
 
 /// Editor (SPEC 10's editor switches).
-fn editor(ui: &mut Ui, draft: &mut Settings) {
+fn editor(ui: &mut Ui, draft: &mut Settings, capabilities: &Capabilities) {
     ui.heading("Editor");
     ui.separator();
     ui.checkbox(
         &mut draft.ask_before_closing,
         "Ask before closing tabs with unsaved changes",
     );
+    // LINUX_SUPPORT.md section 3, item 8: where there is no tray icon at all,
+    // the window's X is the only way out and quitting asks first. A platform
+    // with a tray leaves through File > Exit or the tray's Quit instead, so the
+    // switch would have nothing to do there.
+    let quit = ui.add_enabled(
+        !capabilities.tray,
+        egui::Checkbox::new(&mut draft.ask_before_quitting, "Ask before quitting"),
+    );
+    if capabilities.tray {
+        quit.on_disabled_hover_text(
+            "Not used here: the close button hides to the tray, and File > Exit and the \
+             tray's Quit leave without asking.",
+        );
+    }
     ui.checkbox(
         &mut draft.switch_to_select_after_drawing,
         "Switch to the Select tool after drawing",
@@ -409,12 +548,17 @@ fn advanced(ui: &mut Ui, draft: &mut Settings, config_path: &std::path::Path) {
              brings it back; without a tray icon this is ignored.",
         );
 
-    // SPEC 10 marks "start with Windows" P2.
-    let windows = ui.add_enabled(
-        false,
-        egui::Checkbox::new(&mut draft.start_with_windows, "Start with Windows"),
-    );
-    windows.on_disabled_hover_text("Starting with Windows is P2 and not built.");
+    // SPEC 10's "Start with Windows": a login entry for this exe, written when
+    // the user presses OK (`app::apply_autostart`). Windows only for now.
+    let windows = ui
+        .add_enabled(
+            cfg!(windows),
+            egui::Checkbox::new(&mut draft.start_with_windows, "Start with Windows"),
+        )
+        .on_hover_text(
+            "Start this program when you sign in to Windows. The entry points at this              exe, so tick it again after moving the program.",
+        );
+    windows.on_disabled_hover_text("Starting at login is Windows-only for now.");
 
     ui.label(format!("Config file: {}", config_path.display()));
 }
@@ -427,6 +571,9 @@ mod tests {
     struct State {
         draft: Settings,
         recording: Option<CaptureMode>,
+        /// What the platform backend can do; `FULL` unless a test asks for
+        /// less (LINUX_SUPPORT.md section 3, item 2).
+        capabilities: Capabilities,
         warnings: Vec<String>,
         recent: Vec<Rgba>,
         actions: Vec<Action>,
@@ -441,20 +588,53 @@ mod tests {
                 let State {
                     draft,
                     recording,
+                    capabilities,
                     warnings,
                     recent,
                     actions,
                 } = state;
-                show(ui, draft, &path, *recording, warnings, recent, actions);
+                show(
+                    ui,
+                    draft,
+                    SettingsContext {
+                        config_path: &path,
+                        recording: *recording,
+                        capabilities,
+                        warnings,
+                    },
+                    recent,
+                    actions,
+                );
             },
             State {
                 draft,
                 recording: None,
+                capabilities: Capabilities::FULL,
                 warnings: Vec::new(),
                 recent: Vec::new(),
                 actions: Vec::new(),
             },
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn portal_hotkeys_are_read_only_and_offer_cli_commands() {
+        use egui_kittest::kittest::Queryable as _;
+        let mut portal = harness(Settings::default());
+        portal.state_mut().capabilities = snp_ligase_platform::linux::wayland::CAPABILITIES;
+        portal.run();
+        assert!(portal.query_by_label("Record…").is_none());
+        assert!(portal.query_by_label("Restore defaults").is_none());
+        assert!(portal.query_by_label("Test the hotkeys above").is_none());
+        assert_eq!(portal.get_all_by_label("Copy command").count(), 3);
+        for mode in ["region", "all", "repeat"] {
+            assert!(
+                portal
+                    .query_by_label(&format!("snp-ligase --capture {mode}"))
+                    .is_some()
+            );
+        }
     }
 
     /// The dialog renders, collects actions, and edits the draft — through
@@ -491,6 +671,118 @@ mod tests {
         );
     }
 
+    /// LINUX_SUPPORT.md section 3, item 2: Settings reads the platform's
+    /// capabilities. A control the platform cannot honour is disabled — with
+    /// the reason in words for the Hotkeys section — instead of pretending to
+    /// work.
+    #[test]
+    fn settings_disables_what_the_platform_cannot_do() {
+        use egui_kittest::kittest::{NodeT as _, Queryable as _};
+
+        let mut stub = harness(Settings::default());
+        stub.state_mut().capabilities = Capabilities::NONE;
+        stub.run();
+
+        assert!(
+            stub.get_by_label("Hide snp-ligase while capturing")
+                .accesskit_node()
+                .is_disabled(),
+            "the hide checkbox works without the hide capability"
+        );
+        assert!(
+            stub.get_by_label("Include the mouse cursor in captures")
+                .accesskit_node()
+                .is_disabled(),
+            "the cursor checkbox works without the cursor capability"
+        );
+        assert!(
+            stub.query_by_label(HOTKEYS_UNAVAILABLE).is_some(),
+            "the Hotkeys section does not say why it is off"
+        );
+        assert!(
+            !stub
+                .get_by_label("Ask before quitting")
+                .accesskit_node()
+                .is_disabled(),
+            "the quit confirmation is disabled where it is the only way out"
+        );
+        for node in stub.get_all_by_label("Record…") {
+            assert!(
+                node.accesskit_node().is_disabled(),
+                "a Record button is live without global hotkeys"
+            );
+        }
+        assert!(
+            stub.get_by_label("Restore defaults")
+                .accesskit_node()
+                .is_disabled(),
+            "Restore defaults is live without global hotkeys"
+        );
+
+        // A full platform leaves every one of them alone.
+        let mut full = harness(Settings::default());
+        full.run();
+        assert!(
+            !full
+                .get_by_label("Hide snp-ligase while capturing")
+                .accesskit_node()
+                .is_disabled(),
+            "the hide checkbox is disabled on a full platform"
+        );
+        assert!(
+            full.query_by_label(HOTKEYS_UNAVAILABLE).is_none(),
+            "a full platform still claims global hotkeys are missing"
+        );
+        // Where the window can hide to a tray, the X never quits, so the switch
+        // would have nothing to do (LINUX_SUPPORT.md section 3, item 8).
+        assert!(
+            full.get_by_label("Ask before quitting")
+                .accesskit_node()
+                .is_disabled(),
+            "the quit confirmation is live on a platform with a tray"
+        );
+
+        // LINUX_SUPPORT.md section 4, phase L1a: the X11 backend's own list.
+        // Hotkeys are back (the L0b review carry-over), the cursor and the
+        // window-hiding are real, and there is no tray — so the X11 sections
+        // that were disabled for the stub are live here.
+        #[cfg(target_os = "linux")]
+        {
+            let mut x11 = harness(Settings::default());
+            x11.state_mut().capabilities = snp_ligase_platform::linux::x11::CAPABILITIES;
+            x11.run();
+
+            assert!(
+                x11.query_by_label(HOTKEYS_UNAVAILABLE).is_none(),
+                "X11 registers hotkeys itself, but Settings says they are missing"
+            );
+            for node in x11.get_all_by_label("Record…") {
+                assert!(
+                    !node.accesskit_node().is_disabled(),
+                    "a Record button is disabled where hotkeys work"
+                );
+            }
+            assert!(
+                x11.get_by_label("Include the mouse cursor in captures")
+                    .accesskit_node()
+                    .is_disabled(),
+                "the cursor checkbox is enabled where cursor pixels are unavailable"
+            );
+            assert!(
+                !x11.get_by_label("Hide snp-ligase while capturing")
+                    .accesskit_node()
+                    .is_disabled(),
+                "the hide checkbox is disabled where the window can be hidden"
+            );
+            assert!(
+                !x11.get_by_label("Ask before quitting")
+                    .accesskit_node()
+                    .is_disabled(),
+                "the quit confirmation is disabled where there is no tray"
+            );
+        }
+    }
+
     /// NEXT_STEPS step 9c: Settings > Saving shows the full path a capture
     /// saved *now* would get, so the dated folder is obvious without a
     /// separate "dynamic" switch.
@@ -498,15 +790,26 @@ mod tests {
     fn the_saving_section_previews_the_full_path_of_a_capture_saved_now() {
         use egui_kittest::kittest::Queryable as _;
 
+        // The platform's own folder shape, so the expected line is native:
+        // `C:\Shots\<month>\` on Windows, `/tmp/Shots/<month>/` on Linux.
+        let root = if cfg!(windows) {
+            std::path::PathBuf::from("C:\\Shots")
+        } else {
+            std::path::PathBuf::from("/tmp/Shots")
+        };
         let draft = Settings {
-            save_folder: Some(std::path::PathBuf::from("C:\\Shots\\%Y-%m")),
+            save_folder: Some(root.join("%Y-%m")),
             ..Settings::default()
         };
         let mut harness = harness(draft);
         harness.run();
 
         let month = chrono::Local::now().format("%Y-%m").to_string();
-        let expected = format!("A capture saved now would be C:\\Shots\\{month}\\");
+        let expected = format!(
+            "A capture saved now would be {}{sep}{month}{sep}",
+            root.display(),
+            sep = std::path::MAIN_SEPARATOR
+        );
         assert!(
             harness.query_by_label_contains(&expected).is_some(),
             "the folder was not expanded in the preview line: {expected}"

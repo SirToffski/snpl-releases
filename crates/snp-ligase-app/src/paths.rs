@@ -37,6 +37,18 @@ impl Paths {
         }
     }
 
+    /// Where this program keeps its files, as the line the log and
+    /// `--debug-capture` report (LINUX_SUPPORT.md section 3, item 4): the
+    /// folders `directories` picked for this OS.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        format!(
+            "config: {}\nlogs: {}",
+            self.config_dir.display(),
+            self.log_dir.display()
+        )
+    }
+
     /// The folders with an injected config directory.
     ///
     /// This is what tests use, so a test can never read or write the real
@@ -91,6 +103,23 @@ mod tests {
         };
 
         assert_eq!(paths.log_dir.file_name(), Some(OsStr::new("logs")));
+    }
+
+    /// LINUX_SUPPORT.md L0c item 4: a bug report has to carry both folders, on
+    /// whichever OS it was made.
+    #[test]
+    fn the_summary_names_both_folders() {
+        let paths = Paths::with_config_dir(PathBuf::from("/tmp/snp-ligase-config"));
+        let summary = paths.summary();
+
+        assert!(
+            summary.contains("config: /tmp/snp-ligase-config"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&paths.log_dir.display().to_string()),
+            "{summary}"
+        );
     }
 
     /// NEXT_STEPS step 4: the config directory is injectable, so tests use a

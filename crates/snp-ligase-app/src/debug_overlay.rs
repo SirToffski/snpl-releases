@@ -5,7 +5,7 @@
 //! it is exactly the piece the agent cannot test with pure functions and must
 //! not leave to the human either. This command runs the **real** overlay over a
 //! **real** capture, injects a real drag (or Escape, or a right click, or waits
-//! for the safety timeout), checks what came back, and then asks Windows
+//! for the safety timeout), checks what came back, and then asks the platform
 //! whether any window of the overlay's class is still alive.
 //!
 //! Exit codes: 0 = passed, 1 = failed, 3 = skipped because somebody was using
@@ -13,26 +13,41 @@
 //!
 //! It only injects input once an overlay window really exists, so a failed
 //! start cannot spray clicks across whatever is on screen.
+//!
+//! The variant names, the exit codes and the reporting are this file's; the
+//! run itself belongs to the platform — Windows drives the Win32 overlay here,
+//! X11 hands over to [`snp_ligase_platform::linux::x11::overlay::selfcheck`],
+//! which injects with XTest and walks the X window tree for leftovers
+//! (LINUX_SUPPORT.md section 4, phase L1b).
 
 use std::process::ExitCode;
+
+#[cfg(windows)]
 use std::time::Duration;
 
+#[cfg(windows)]
 use snp_ligase_platform::windows::{WindowsPlatform, overlay, synth};
+#[cfg(windows)]
 use snp_ligase_platform::{CaptureOptions, Platform, RectI};
 
 /// The last keyboard or mouse input must be at least this old before the check
 /// runs: it takes over the screen for a second or two.
+#[cfg(windows)]
 const IDLE_REQUIRED_SECONDS: f64 = 3.0;
 
 /// How long the overlay is given to appear before the injected input gives up.
+#[cfg(windows)]
 const OVERLAY_APPEARS_WITHIN: Duration = Duration::from_secs(3);
 
 /// The short timeout the `timeout` variant asks the overlay to use.
+#[cfg(windows)]
 const SHORT_TIMEOUT: Duration = Duration::from_millis(1500);
 
 /// The rectangle the `drag` variant selects, as an offset and a size inside the
 /// primary monitor.
+#[cfg(windows)]
 const DRAG_AT: (i32, i32) = (150, 150);
+#[cfg(windows)]
 const DRAG_SIZE: (i32, i32) = (400, 300);
 
 /// What the command line asked this command to do.
@@ -116,7 +131,54 @@ pub fn run(variant: Variant, allow_busy: bool) -> ExitCode {
     }
 }
 
-/// The check itself.
+/// The check itself: the platform's own overlay self-check.
+///
+/// The variant crossing a process's worth of code is only this mapping: the
+/// three outcomes and their wording are the platforms' own, so the report a
+/// run prints is written where the run happened.
+#[cfg(target_os = "linux")]
+fn attempt(variant: Variant, allow_busy: bool) -> Outcome {
+    use snp_ligase_platform::linux::{SessionEnv, SessionKind};
+
+    // The Wayland session: there is no X11 server to synthesise input on, and
+    // the Wayland overlay's check is the real runs of this step (L3b,
+    // ydotool), not this --debug-overlay machinery. Saying so is honest; a
+    // half-working check would lie (NEXT_STEPS section 6c).
+    if SessionEnv::read().kind() == SessionKind::Wayland {
+        return Outcome::Skipped(format!(
+            "--debug-overlay does not drive the Wayland overlay; the L3b real runs \
+             (ydotool) are its check (variant {variant:?})"
+        ));
+    }
+
+    use snp_ligase_platform::linux::x11::overlay::selfcheck;
+
+    match selfcheck::run(platform_variant(variant), allow_busy) {
+        selfcheck::Outcome::Passed(detail) => Outcome::Passed(detail),
+        selfcheck::Outcome::Skipped(why) => Outcome::Skipped(why),
+        selfcheck::Outcome::Failed(why) => Outcome::Failed(why),
+    }
+}
+
+/// This command's variant as the X11 self-check's own (LINUX_SUPPORT.md section
+/// 4, phase L1b).
+#[cfg(target_os = "linux")]
+#[must_use]
+fn platform_variant(
+    variant: Variant,
+) -> snp_ligase_platform::linux::x11::overlay::selfcheck::Variant {
+    use snp_ligase_platform::linux::x11::overlay::selfcheck::Variant as X11;
+
+    match variant {
+        Variant::Drag => X11::Drag,
+        Variant::Escape => X11::Escape,
+        Variant::RightClick => X11::RightClick,
+        Variant::Timeout => X11::Timeout,
+    }
+}
+
+/// The check itself, on Windows.
+#[cfg(windows)]
 fn attempt(variant: Variant, allow_busy: bool) -> Outcome {
     // The foreground guard: never take the screen while somebody is using it,
     // unless the human explicitly said so.
@@ -264,6 +326,7 @@ fn attempt(variant: Variant, allow_busy: bool) -> Outcome {
 
 /// Whether two rectangles differ by at most one pixel, which is all the
 /// cursor's own rounding can explain.
+#[cfg(windows)]
 fn close_enough(a: RectI, b: RectI) -> bool {
     (a.x - b.x).abs() <= 1
         && (a.y - b.y).abs() <= 1
@@ -288,6 +351,7 @@ mod tests {
         assert!(error.to_string().contains("right-click"), "{error}");
     }
 
+    #[cfg(windows)]
     #[test]
     fn a_rectangle_one_pixel_off_is_close_enough() {
         let rect = RectI {
@@ -315,5 +379,29 @@ mod tests {
                 h: 300
             }
         ));
+    }
+
+    /// The four names this command parses are the four the X11 self-check
+    /// runs, one to one: a variant added on one side and forgotten on the other
+    /// would run the wrong check (LINUX_SUPPORT.md section 4, phase L1b).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_variant_has_an_x11_twin() {
+        use snp_ligase_platform::linux::x11::overlay::selfcheck::Variant as X11;
+
+        let expected = [
+            (Variant::Drag, X11::Drag),
+            (Variant::Escape, X11::Escape),
+            (Variant::RightClick, X11::RightClick),
+            (Variant::Timeout, X11::Timeout),
+        ];
+        assert_eq!(expected.len(), Variant::ALL.len());
+        assert_eq!(expected.len(), X11::ALL.len());
+        for (ours, theirs) in expected {
+            assert_eq!(platform_variant(ours), theirs, "{}", ours.name());
+            // The name has to match as well: it is what `--debug-overlay
+            // <name>` takes.
+            assert_eq!(ours.name(), theirs.name(), "{ours:?}");
+        }
     }
 }

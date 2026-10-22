@@ -11,6 +11,8 @@
 const WINDOW_PNG: &[u8] = include_bytes!("../assets/snpl-256.png");
 
 /// 32 px, for the tray: drawn at 16-32 px depending on the display scale.
+/// Windows only: there is no tray icon on Linux yet (LINUX_SUPPORT.md section 1).
+#[cfg(windows)]
 const TRAY_PNG: &[u8] = include_bytes!("../assets/snpl-32.png");
 
 /// Straight-alpha RGBA pixels and their size.
@@ -53,11 +55,12 @@ pub fn window_icon() -> Result<egui::IconData, String> {
     })
 }
 
-/// The tray icon's pixels.
+/// The tray icon's pixels (Windows only, like the tray).
 ///
 /// # Errors
 ///
 /// See [`decode`].
+#[cfg(windows)]
 pub fn tray_pixels() -> Result<IconPixels, String> {
     decode(TRAY_PNG, "tray")
 }
@@ -78,6 +81,7 @@ mod tests {
         assert_eq!(icon.rgba.len(), 256 * 256 * 4);
     }
 
+    #[cfg(windows)]
     #[test]
     fn the_tray_icon_decodes_at_32_px_with_a_transparent_background() {
         let icon = tray_pixels().expect("the embedded tray icon decodes");

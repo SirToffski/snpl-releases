@@ -1,0 +1,23 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=snp-ligase
+GenericName=Screenshot and annotation tool
+Comment=Take screenshots and annotate them
+Exec=@BINDIR@/snp-ligase %F
+Icon=snp-ligase
+Terminal=false
+Categories=Utility;
+Keywords=screenshot;capture;annotate;snip;
+MimeType=image/png;image/jpeg;image/webp;image/bmp;image/gif;image/jxl;
+StartupWMClass=snp-ligase
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
+Actions=capture-region;capture-monitor;
+
+[Desktop Action capture-region]
+Name=Capture a region
+Exec=@BINDIR@/snp-ligase --capture region
+
+[Desktop Action capture-monitor]
+Name=Capture the current monitor
+Exec=@BINDIR@/snp-ligase --capture monitor

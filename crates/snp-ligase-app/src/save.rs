@@ -153,6 +153,9 @@ fn run_worker(
 ) {
     while let Ok(job) = jobs.recv() {
         let outcome = run_job(&job);
+        if let Ok(mut claims) = wake.save_claims.lock() {
+            claims.remove(&job.path);
+        }
         // A repaint before the send: if the UI is mid-frame it will pick the
         // outcome up next frame either way.
         wake.wake();
@@ -219,4 +222,63 @@ fn run_job(job: &SaveJob) -> SaveOutcome {
         auto: job.auto,
         result,
     }
+}
+
+/// Wayland completion cannot depend on a frame. Share H1 name claims with
+/// UI saves; the destination still appears only after its atomic write.
+pub fn capture_to_disk(
+    settings: &crate::settings::Settings,
+    image: &image::RgbaImage,
+    claims: &std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+) -> Option<Result<PathBuf, String>> {
+    if !settings.auto_save_new_captures {
+        return None;
+    }
+    Some((|| {
+        let now = chrono::Local::now();
+        let (folder, warning) = settings.resolved_save_folder_at(now);
+        let (name, name_warning) = settings.file_name(now);
+        for warning in [warning, name_warning].into_iter().flatten() {
+            tracing::warn!(%warning, "capture auto-save naming");
+        }
+        std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+        let format = settings.default_format();
+        let mut suffix = 0_u64;
+        let mut claimed = claims.lock().map_err(|e| e.to_string())?;
+        let path = loop {
+            let stem = if suffix == 0 {
+                name.clone()
+            } else {
+                format!("{name}-{suffix}")
+            };
+            let path = folder.join(format!("{stem}.{}", format.extension()));
+            if claimed.contains(&path) {
+                suffix += 1;
+                continue;
+            }
+            if path.exists() {
+                suffix += 1;
+                continue;
+            }
+            break path;
+        };
+        claimed.insert(path.clone());
+        drop(claimed);
+        let result = codec::encode(image, format, &settings.encode_options())
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| crate::tab::write_atomically(&path, &bytes));
+        if let Ok(mut claimed) = claims.lock() {
+            claimed.remove(&path);
+        }
+        match result {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "capture auto-saved without a UI frame");
+                Ok(path)
+            }
+            Err(error) => {
+                tracing::warn!(%error, "capture auto-save failed");
+                Err(error)
+            }
+        }
+    })())
 }

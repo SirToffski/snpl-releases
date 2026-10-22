@@ -410,7 +410,51 @@ const SHORTCUTS: &[Shortcut] = &[
 /// own hotkey settings, so neither can list a key that does not exist (SPEC
 /// 8.3, and the "every property is reachable" rule of SPEC 8.1).
 #[must_use]
+#[cfg(test)]
 pub fn help_rows(settings: &crate::settings::Settings) -> Vec<ShortcutRow> {
+    help_rows_for(settings, snp_ligase_platform::HotkeySupport::Native)
+}
+
+pub fn capture_bindings(
+    settings: &crate::settings::Settings,
+    support: snp_ligase_platform::HotkeySupport,
+) -> Vec<(crate::panels::CaptureMode, String)> {
+    #[cfg(target_os = "linux")]
+    let bound = snp_ligase_platform::linux::wayland::shortcuts::bound();
+    #[cfg(not(target_os = "linux"))]
+    let bound = Vec::new();
+    capture_bindings_from(settings, support, &bound)
+}
+
+fn capture_bindings_from(
+    settings: &crate::settings::Settings,
+    support: snp_ligase_platform::HotkeySupport,
+    bound: &[(String, String)],
+) -> Vec<(crate::panels::CaptureMode, String)> {
+    use crate::panels::CaptureMode;
+    CaptureMode::ALL
+        .into_iter()
+        .map(|mode| {
+            let text = if support == snp_ligase_platform::HotkeySupport::Portal {
+                bound
+                    .iter()
+                    .find(|(id, _)| *id == crate::hotkeys::portal_id(mode))
+                    .map(|(_, text)| text.clone())
+                    .unwrap_or_default()
+            } else if mode == CaptureMode::RepeatLastRegion {
+                String::new()
+            } else {
+                settings.hotkey_text(mode).trim().to_owned()
+            };
+            (mode, text)
+        })
+        .collect()
+}
+
+pub fn help_rows_for(
+    settings: &crate::settings::Settings,
+    support: snp_ligase_platform::HotkeySupport,
+) -> Vec<ShortcutRow> {
     let mut rows: Vec<ShortcutRow> = SHORTCUTS
         .iter()
         .map(|shortcut| ShortcutRow {
@@ -428,23 +472,17 @@ pub fn help_rows(settings: &crate::settings::Settings) -> Vec<ShortcutRow> {
         });
     }
 
-    for mode in crate::hotkeys::HOTKEY_MODES {
-        let text = settings.hotkey_text(mode).trim();
+    for (mode, text) in capture_bindings(settings, support) {
         rows.push(ShortcutRow {
             group: "Capture (global hotkeys)",
-            keys: if text.is_empty() {
-                "none".to_owned()
+            keys: if text.is_empty() { "none".into() } else { text },
+            what: if mode == crate::panels::CaptureMode::RepeatLastRegion {
+                "Repeat Last Region (on the Capture menu and the tray)".into()
             } else {
-                text.to_owned()
+                format!("Capture {}", mode.label().to_lowercase())
             },
-            what: format!("Capture {}", mode.label().to_lowercase()),
         });
     }
-    rows.push(ShortcutRow {
-        group: "Capture (global hotkeys)",
-        keys: "none".to_owned(),
-        what: "Repeat Last Region (on the Capture menu and the tray)".to_owned(),
-    });
 
     rows
 }
@@ -837,4 +875,58 @@ mod tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn w2_portal_bindings_replace_native_defaults_including_repeat() {
+    use crate::panels::CaptureMode;
+    use snp_ligase_platform::HotkeySupport;
+    let settings = crate::settings::Settings::default();
+    let bound = vec![
+        ("region".into(), "Ctrl+Print".into()),
+        ("repeat".into(), "Meta+R".into()),
+    ];
+    let portal = capture_bindings_from(&settings, HotkeySupport::Portal, &bound);
+    assert_eq!(
+        portal
+            .iter()
+            .find(|(m, _)| *m == CaptureMode::Region)
+            .unwrap()
+            .1,
+        "Ctrl+Print"
+    );
+    assert_eq!(
+        portal
+            .iter()
+            .find(|(m, _)| *m == CaptureMode::RepeatLastRegion)
+            .unwrap()
+            .1,
+        "Meta+R"
+    );
+    assert!(
+        portal
+            .iter()
+            .find(|(m, _)| *m == CaptureMode::CurrentMonitor)
+            .unwrap()
+            .1
+            .is_empty()
+    );
+    let native = capture_bindings_from(&settings, HotkeySupport::Native, &bound);
+    assert_eq!(
+        native
+            .iter()
+            .find(|(m, _)| *m == CaptureMode::Region)
+            .unwrap()
+            .1,
+        settings.hotkey_text(CaptureMode::Region)
+    );
+    assert!(
+        native
+            .iter()
+            .find(|(m, _)| *m == CaptureMode::RepeatLastRegion)
+            .unwrap()
+            .1
+            .is_empty()
+    );
 }
