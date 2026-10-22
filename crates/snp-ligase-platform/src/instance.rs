@@ -323,20 +323,34 @@ pub struct Server {
 #[derive(Debug, Clone)]
 pub struct SocketFile {
     path: PathBuf,
-    /// `(device, inode)` of the socket this handle stands for, `None` when the
-    /// file could not be looked at. A socket a later instance bound in the
-    /// meantime has a different inode and is left alone.
-    identity: Option<(u64, u64)>,
+    /// `(device, inode, ctime seconds, ctime nanoseconds)` of the socket this
+    /// handle stands for, `None` when the file could not be looked at. A socket
+    /// a later instance bound in the meantime is left alone. The inode alone
+    /// is not enough: tmpfs and overlay file systems (containers, `/run/user`)
+    /// hand a freed inode number to the next file at once, so the later socket
+    /// can carry the same one; its change time is still its own.
+    identity: Option<(u64, u64, i64, i64)>,
+}
+
+/// What tells this socket file apart from a later one at the same path (see
+/// [`SocketFile`]'s `identity`).
+#[cfg(unix)]
+fn socket_identity(metadata: &std::fs::Metadata) -> (u64, u64, i64, i64) {
+    use std::os::unix::fs::MetadataExt as _;
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
 }
 
 #[cfg(unix)]
 impl SocketFile {
     /// Removes the socket, unless it is no longer the one this handle bound.
     pub fn remove(&self) {
-        use std::os::unix::fs::MetadataExt as _;
         match (std::fs::metadata(&self.path), self.identity) {
-            (Ok(metadata), Some((device, inode)))
-                if metadata.dev() == device && metadata.ino() == inode => {}
+            (Ok(metadata), Some(identity)) if socket_identity(&metadata) == identity => {}
             (Ok(_), Some(_)) => {
                 tracing::debug!(
                     path = %self.path.display(),
@@ -414,11 +428,9 @@ impl Server {
                 "could not tighten the instance channel's permissions"
             );
         }
+        // Read after the chmod above, so the change time is final.
         let identity = match std::fs::metadata(path) {
-            Ok(metadata) => {
-                use std::os::unix::fs::MetadataExt as _;
-                Some((metadata.dev(), metadata.ino()))
-            }
+            Ok(metadata) => Some(socket_identity(&metadata)),
             Err(err) => {
                 tracing::warn!(
                     path = %path.display(),
@@ -898,11 +910,20 @@ mod tests {
                 drop(crashed);
             }
             assert!(path.exists(), "the test did not leave a socket behind");
-            assert!(
-                !send_to(&path, &[Message::Show])
-                    .expect("connecting to a dead socket is not fatal"),
-                "the dead socket took a message"
-            );
+            // Another test can fork a child (the overlay, the stalled-compositor
+            // probe) while the listener above is still open; until that child
+            // execs, it holds a copy of the descriptor and the kernel still
+            // queues connections on it. The dead socket refuses once every copy
+            // is closed, which takes microseconds: wait for that, bounded.
+            let refused = (0..50).any(|_| {
+                let delivered = send_to(&path, &[Message::Show])
+                    .expect("connecting to a dead socket is not fatal");
+                if delivered {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                !delivered
+            });
+            assert!(refused, "the dead socket kept taking messages for a second");
 
             let server = Server::bind_at(&path).expect("the stale socket should be replaced");
             assert!(path.exists(), "the channel is not there after the bind");
@@ -920,6 +941,12 @@ mod tests {
             // its server, so the handle the app kept is what removes the socket.
             drop(first);
             assert!(!path.exists(), "the socket was not removed on drop");
+
+            // tmpfs and overlay hand the freed inode number straight to the next
+            // socket (it failed this way in the release CI's containers), so the
+            // change time is what tells the two apart. Its clock ticks every few
+            // milliseconds; real instances are seconds apart.
+            std::thread::sleep(std::time::Duration::from_millis(20));
 
             // A later launch binds the channel again, at the same path.
             let second = Server::bind_at(&path).expect("the channel should be free again");
