@@ -1,16 +1,19 @@
-# Builds snpl.exe for Windows x86_64 and publishes it as a GitHub Release.
+# Builds snpl for Windows x86_64, Arch Linux x86_64 and Fedora x86_64, and
+# publishes them as one GitHub Release.
 #
 # How to cut a release:
-#   1. Bump `version` in the root Cargo.toml (and the manifest's
-#      assemblyIdentity version) if you want the exe to report it.
-#   2. git tag v0.1.0 && git push origin v0.1.0
-# The workflow builds from that tag, runs the tests, and attaches:
-#   - snpl.exe                                  the program itself
-#   - snpl-<tag>-windows-x86_64.zip             the same exe zipped
-#   - SHA256SUMS.txt                            checksums of both
-# plus a signed build-provenance attestation, so anyone can check the exe was
-# built by this workflow from this repo:
-#   gh attestation verify snpl.exe --repo <owner>/<repo>
+#   1. python scripts/sync_from_dev.py <dev checkout> <version>, then
+#      `cargo update -w`; that sets the version in Cargo.toml, the PKGBUILD
+#      and the .spec in one go.
+#   2. git tag v<version> && git push origin v<version>
+# The workflow checks the three versions match the tag, builds and tests on
+# each platform, and attaches:
+#   - snpl.exe, snpl-<tag>-windows-x86_64.zip     Windows
+#   - snpl-<version>-1-x86_64.pkg.tar.zst         Arch Linux / EndeavourOS
+#   - snpl-<version>-1.fc<N>.x86_64.rpm           Fedora
+#   - SHA256SUMS.txt                              checksums of all of them
+# plus a signed build-provenance attestation for every file:
+#   gh attestation verify <file> --repo <owner>/<repo>
 #
 # "Run workflow" on the Actions tab (workflow_dispatch) builds and tests the
 # same way and uploads the files as a workflow artifact, without publishing a
@@ -25,33 +28,51 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write       # create the release and upload its files
-  id-token: write       # sign the build-provenance attestation
-  attestations: write   # store the attestation
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
 jobs:
-  windows-x86_64:
-    name: Build snpl.exe (Windows x86_64)
-    runs-on: windows-latest
-    env:
-      CARGO_TERM_COLOR: always
-      # Smaller, reproducible-ish release builds; matches a local `cargo build --release`.
-      CARGO_INCREMENTAL: "0"
+  versions:
+    name: Check the versions agree
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
     steps:
-      - name: Check out the source
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+      - id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          pkgbuild=$(sed -n 's/^pkgver=\(.*\)$/\1/p' packaging/arch/PKGBUILD)
+          spec=$(sed -n 's/^Version: *\(.*\)$/\1/p' packaging/fedora/snpl.spec)
+          echo "Cargo.toml $cargo, PKGBUILD $pkgbuild, spec $spec"
+          [ "$cargo" = "$pkgbuild" ] && [ "$cargo" = "$spec" ] || { echo "::error::the versions differ"; exit 1; }
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$cargo" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not v$cargo"; exit 1
+          fi
+          echo "version=$cargo" >> "$GITHUB_OUTPUT"
+
+  windows-x86_64:
+    name: Windows x86_64
+    needs: versions
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
 
       - name: Install Rust (stable, MSVC)
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cache cargo registry and target
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Run the tests
         run: cargo test --workspace --locked
@@ -60,33 +81,106 @@ jobs:
         run: cargo build --release --locked -p snp-ligase-app --target x86_64-pc-windows-msvc
 
       - name: Package
-        id: package
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $tag = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0,7))" }
           $exe = "target/x86_64-pc-windows-msvc/release/snpl.exe"
           if (-not (Test-Path $exe)) { throw "snpl.exe was not built" }
-
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item $exe dist/snpl.exe
-
-          # The zip carries the exe plus any license/readme files the repo has.
           $stage = "stage/snpl-$tag-windows-x86_64"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item $exe $stage/
           Get-ChildItem -File -Path . | Where-Object { $_.Name -match '^(LICENSE|README)' } | Copy-Item -Destination $stage/
-          $zip = "dist/snpl-$tag-windows-x86_64.zip"
-          Compress-Archive -Path "$stage/*" -DestinationPath $zip
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/snpl-$tag-windows-x86_64.zip"
 
-          # Checksums, in the format `sha256sum -c` understands.
-          Get-ChildItem dist -File | Where-Object { $_.Name -ne 'SHA256SUMS.txt' } | ForEach-Object {
-            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-            "$hash  $($_.Name)"
-          } | Set-Content -Encoding ascii dist/SHA256SUMS.txt
-          Get-Content dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
 
-          "tag=$tag" >> $env:GITHUB_OUTPUT
+  arch-x86_64:
+    name: Arch Linux x86_64
+    needs: versions
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install the build tools
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust \
+            libx11 libxcb libxcursor libxi libxkbcommon libxkbcommon-x11 \
+            wayland libglvnd vulkan-icd-loader dbus hicolor-icon-theme
+
+      - uses: actions/checkout@v5
+
+      - name: Build and test the package (makepkg)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # makepkg refuses to run as root.
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && SNPL_SRC='$GITHUB_WORKSPACE' makepkg -f -d --noconfirm"
+          mkdir -p dist
+          cp packaging/arch/*.pkg.tar.zst dist/
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: dist/*
+          if-no-files-found: error
+
+  fedora-x86_64:
+    name: Fedora x86_64
+    needs: versions
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - name: Install the build tools
+        run: |
+          dnf -y install git rpm-build cargo rust gcc pkgconf-pkg-config \
+            libX11-devel libxkbcommon-devel wayland-devel libXcursor-devel \
+            libXi-devel mesa-libEGL-devel vulkan-loader-devel
+
+      - uses: actions/checkout@v5
+
+      - name: Build and test the package (rpmbuild)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rpmbuild -bb --build-in-place --define "_topdir $PWD/rpmbuild" packaging/fedora/snpl.spec
+          mkdir -p dist
+          cp rpmbuild/RPMS/x86_64/*.rpm dist/
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fedora
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Checksums, attestations and the release
+    needs: [versions, windows-x86_64, arch-x86_64, fedora-x86_64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # create the release and upload its files
+      id-token: write       # sign the build-provenance attestation
+      attestations: write   # store the attestation
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@v2
@@ -94,12 +188,14 @@ jobs:
           subject-path: |
             dist/snpl.exe
             dist/snpl-*.zip
+            dist/*.pkg.tar.zst
+            dist/*.rpm
 
       - name: Upload the build (manual runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: snpl-${{ steps.package.outputs.tag }}-windows-x86_64
+          name: snpl-${{ needs.versions.outputs.version }}-all
           path: dist/*
           if-no-files-found: error
 
@@ -112,10 +208,14 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           body: |
-            Windows 10/11, x86_64. Download `snpl.exe` (or the zip) and run it; there is no installer.
+            **Windows 10/11, x86_64.** Download `snpl.exe` (or the zip) and run it; there is no installer. SmartScreen will warn that the publisher is unknown, because the exe is not code-signed: choose "More info" → "Run anyway".
 
-            **Windows SmartScreen** will warn that the publisher is unknown, because the exe is not code-signed. Choose "More info" → "Run anyway".
+            **Arch Linux / EndeavourOS, x86_64.** `sudo pacman -U snpl-${{ needs.versions.outputs.version }}-1-x86_64.pkg.tar.zst`
 
-            **Check the download** — every file here was built by this repository's GitHub Actions workflow from the tagged source:
-            - SHA-256: compare with `SHA256SUMS.txt` (`Get-FileHash snpl.exe` in PowerShell).
-            - Build provenance: `gh attestation verify snpl.exe --repo ${{ github.repository }}`
+            **Fedora, x86_64.** `sudo dnf install ./snpl-${{ needs.versions.outputs.version }}-1.fc*.x86_64.rpm`
+
+            On Linux the command is `snpl`; the menu entry is "snp-ligase". It works on X11 and on Wayland (KDE Plasma natively; other desktops through the screenshot portal). The packages are not signed: check them as below.
+
+            **Check the download.** Every file here was built by this repository's GitHub Actions workflow from the tagged source:
+            - SHA-256: compare with `SHA256SUMS.txt` (`sha256sum -c SHA256SUMS.txt --ignore-missing`, or `Get-FileHash` in PowerShell).
+            - Build provenance: `gh attestation verify <file> --repo ${{ github.repository }}`
