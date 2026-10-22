@@ -314,26 +314,6 @@ fn saving(ui: &mut Ui, draft: &mut Settings, recent: &mut Vec<Rgba>, actions: &m
     }
 }
 
-/// The program's own name for the CLI commands Settings offers to copy.
-///
-/// It is the running executable's file name, not a fixed string: the dev
-/// build is `snp-ligase`, the released packages install `snpl`, and a
-/// command that names the wrong binary does nothing when bound. Tests run
-/// from the test harness, so they see the dev name.
-fn command_name() -> String {
-    if cfg!(test) {
-        return crate::APP_NAME.to_owned();
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
-            exe.file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-        })
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| crate::APP_NAME.to_owned())
-}
-
 /// Hotkeys (SPEC 10's "Hotkeys for the four capture modes", with conflicts).
 ///
 /// Each row has a "Record…" button (NEXT_STEPS step 7): while `recording` is
@@ -378,7 +358,7 @@ fn hotkeys(
             .filter(|mode| mode.blocked(capabilities).is_none())
         {
             let mode = crate::hotkeys::portal_id(mode);
-            let command = format!("{} --capture {mode}", command_name());
+            let command = format!("{} --capture {mode}", crate::command_name());
             ui.horizontal(|ui| {
                 ui.monospace(&command);
                 if ui.button("Copy command").clicked() {

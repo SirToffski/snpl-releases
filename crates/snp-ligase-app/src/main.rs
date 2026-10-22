@@ -39,6 +39,27 @@ use std::process::ExitCode;
 /// name; the project is `snp-ligase`, read "snip".
 pub const APP_NAME: &str = "snp-ligase";
 
+/// The program's own command name, for `--help` and the CLI commands Settings
+/// offers to copy.
+///
+/// It is the running executable's file name, not a fixed string: the dev
+/// build is `snp-ligase`, the released packages install `snpl`, and a command
+/// that names the wrong binary does nothing when bound. Tests run from the
+/// test harness, so they see the dev name.
+pub fn command_name() -> String {
+    if cfg!(test) {
+        return APP_NAME.to_owned();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+        })
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| APP_NAME.to_owned())
+}
+
 fn main() -> ExitCode {
     // Logging starts first, so even a bad command line is recorded: a capture
     // problem is diagnosed from the log file, never from memory.
@@ -702,32 +723,35 @@ fn capture_modes() -> String {
 
 /// The `--help` text.
 fn help_text() -> String {
+    // The usage lines name the binary as it was installed (`snp-ligase` in
+    // development, `snpl` in the released packages); the title is the app.
+    let command = command_name();
+    let row = |usage: &str, what: &str| format!("  {:<33}{what}", format!("{command}{usage}"));
+    let more = |what: &str| format!("  {:<33}{what}", "");
     let mut lines = vec![
         format!("{APP_NAME} {}\n", env!("CARGO_PKG_VERSION")),
-        format!("  {APP_NAME}                       open the editor"),
-        format!("  {APP_NAME} <image>...            open each image in a tab"),
+        row("", "open the editor"),
+        row(" <image>...", "open each image in a tab"),
     ];
     // `--capture` travels on the instance channel, which only the Unix builds
     // have wired (LINUX_SUPPORT.md section 3, item 9).
     #[cfg(unix)]
     {
-        lines.push(format!(
-            "  {APP_NAME} --capture <mode>      run one capture now, in the running instance"
+        lines.push(row(
+            " --capture <mode>",
+            "run one capture now, in the running instance",
         ));
-        lines.push(format!(
-            "                                   (mode: {})",
-            capture_modes()
-        ));
+        lines.push(more(&format!("(mode: {})", capture_modes())));
     }
-    lines.push(format!(
-        "  {APP_NAME} --debug-capture <dir> capture every monitor into <dir>"
+    lines.push(row(
+        " --debug-capture <dir>",
+        "capture every monitor into <dir>",
     ));
-    lines.push(format!(
-        "  {APP_NAME} --debug-overlay <v>   drive the region overlay and check it cleans up"
+    lines.push(row(
+        " --debug-overlay <v>",
+        "drive the region overlay and check it cleans up",
     ));
-    lines.push(
-        "                                   (v = drag | esc | right-click | timeout)".to_owned(),
-    );
+    lines.push(more("(v = drag | esc | right-click | timeout)"));
     format!("{}\n", lines.join("\n"))
 }
 
