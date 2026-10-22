@@ -26,6 +26,8 @@ BuildRequires:  pkgconf-pkg-config
 BuildRequires:  libX11-devel
 BuildRequires:  libxkbcommon-devel
 BuildRequires:  wayland-devel
+# %check runs the tests; one of them needs at least one installed font.
+BuildRequires:  dejavu-sans-fonts
 
 # Linked: libX11, libX11-xcb (found automatically). Loaded at run time, so
 # listed by hand: xkbcommon (and its X11 part), Wayland, EGL or Vulkan for

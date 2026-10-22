@@ -23,6 +23,8 @@ depends=('gcc-libs' 'glibc' 'libx11' 'libxcb' 'libxcursor' 'libxi'
          'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libglvnd'
          'vulkan-icd-loader' 'dbus' 'hicolor-icon-theme')
 makedepends=('cargo')
+# check() runs the tests; one of them needs at least one installed font.
+checkdepends=('ttf-dejavu')
 optdepends=('xdg-desktop-portal: screenshots and global shortcuts on Wayland'
             'xdg-desktop-portal-kde: the portal backend for KDE Plasma'
             'xdg-desktop-portal-wlr: the portal backend for wlroots compositors')

@@ -111,7 +111,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust \
             libx11 libxcb libxcursor libxi libxkbcommon libxkbcommon-x11 \
-            wayland libglvnd vulkan-icd-loader dbus hicolor-icon-theme
+            wayland libglvnd vulkan-icd-loader dbus hicolor-icon-theme ttf-dejavu
 
       - uses: actions/checkout@v5
 
@@ -143,7 +143,7 @@ jobs:
         run: |
           dnf -y install git rpm-build cargo rust gcc pkgconf-pkg-config \
             libX11-devel libxkbcommon-devel wayland-devel libXcursor-devel \
-            libXi-devel mesa-libEGL-devel vulkan-loader-devel
+            libXi-devel mesa-libEGL-devel vulkan-loader-devel dejavu-sans-fonts
 
       - uses: actions/checkout@v5
 
