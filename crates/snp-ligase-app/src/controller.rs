@@ -1269,10 +1269,17 @@ mod tests {
             worker.capture(CaptureMode::AllMonitors, 0);
             worker.capture(CaptureMode::AllMonitors, 0);
         });
+        // The barrier, not the clock, is what proves the point: the encodes
+        // cannot finish until it is released below, so both tabs arriving
+        // first means encoding did not block the controller. The timeouts only
+        // keep a broken build from hanging, and are generous because the real
+        // encodes after the release are two large PNGs in an unoptimised test
+        // build on whatever machine runs the tests (a shared CI runner took
+        // more than 3 s).
         let mut tabs = 0;
         while tabs < 2 {
             match events
-                .recv_timeout(std::time::Duration::from_secs(2))
+                .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("encoding blocked the capture controller")
             {
                 UiEvent::NewCaptureSaved { saving: true, .. } => tabs += 1,
@@ -1284,8 +1291,8 @@ mod tests {
         let mut saved = 0;
         while saved < 2 {
             if let UiEvent::CaptureSaved { result, .. } = events
-                .recv_timeout(std::time::Duration::from_secs(3))
-                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .expect("a released save never finished")
             {
                 result.unwrap();
                 saved += 1;
@@ -1321,8 +1328,10 @@ mod tests {
             if let UiEvent::CaptureSaved {
                 result: Ok(path), ..
             } = events
-                .recv_timeout(std::time::Duration::from_secs(3))
-                .unwrap()
+                // Two real PNG encodes in an unoptimised test build: generous,
+                // so a slow CI runner does not fail it (it only bounds a hang).
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .expect("an auto-save never finished")
             {
                 paths.push(path);
             }
@@ -1363,14 +1372,16 @@ mod tests {
         assert_eq!(CAPTURE_WAIT_NOTICE, std::time::Duration::from_secs(2));
         let (events, received) = std::sync::mpsc::channel();
         let window = Arc::new(WindowGate::default());
+        // 500 ms, not the real 2 s, to keep the test quick; long enough that a
+        // briefly descheduled test thread still sees "nothing yet" first.
         let done = waiting_status(
             events.clone(),
             window.clone(),
-            std::time::Duration::from_millis(20),
+            std::time::Duration::from_millis(500),
         );
         assert!(received.try_recv().is_err());
         assert!(
-            matches!(received.recv_timeout(std::time::Duration::from_secs(1)).unwrap(), UiEvent::Status(message) if message == "Waiting for the desktop to allow the screenshot…")
+            matches!(received.recv_timeout(std::time::Duration::from_secs(10)).unwrap(), UiEvent::Status(message) if message == "Waiting for the desktop to allow the screenshot…")
         );
         drop(done);
         drop(waiting_status(
