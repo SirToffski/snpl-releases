@@ -280,7 +280,7 @@ fn private_dir_problem(metadata: &std::fs::Metadata, uid: u32) -> Option<String>
         return Some("it is not a directory".to_owned());
     }
     if metadata.uid() != uid {
-        return Some(format!("it is owned by uid {}, not {uid}", metadata.uid()));
+        return Some("it is owned by another user".to_owned());
     }
     let mode = metadata.permissions().mode() & 0o777;
     if mode != 0o700 {
@@ -807,7 +807,7 @@ mod tests {
                 std::fs::symlink_metadata(&directory).expect("the directory should exist");
             let problem = private_dir_problem(&metadata, current_uid() + 1)
                 .expect("another user's directory has to be refused");
-            assert!(problem.contains("owned by uid"), "{problem}");
+            assert_eq!(problem, "it is owned by another user");
         }
 
         #[test]

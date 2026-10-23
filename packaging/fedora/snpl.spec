@@ -13,7 +13,7 @@
 %global debug_package %{nil}
 
 Name:           snpl
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        Screenshot and annotation tool (snp-ligase)
 License:        MIT
@@ -87,6 +87,11 @@ install -Dm644 crates/snp-ligase-app/assets/snpl-32.png \
 %{_datadir}/icons/hicolor/32x32/apps/snp-ligase.png
 
 %changelog
+* Thu Oct 22 2026 SirToffski - 0.3.1-1
+- First published Linux release (0.3.0 was tagged but never released): the
+  instance-channel ownership warning no longer names uids; tests made robust
+  on slow and font-less build machines.
+
 * Thu Oct 22 2026 SirToffski - 0.3.0-1
 - First Linux release: X11, KDE Plasma Wayland (native capture), and the
   screenshot portal on other Wayland desktops.

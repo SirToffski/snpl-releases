@@ -11,7 +11,7 @@
 # that id, and grants KWin's native capture to the `Exec` path in the entry.
 
 pkgname=snpl
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc='Screenshot and annotation tool (snp-ligase)'
 arch=('x86_64')
