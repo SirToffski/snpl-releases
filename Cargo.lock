@@ -4607,7 +4607,7 @@ checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
 
 [[package]]
 name = "snp-ligase-app"
-version = "0.3.1"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "arboard",
@@ -4635,7 +4635,7 @@ dependencies = [
 
 [[package]]
 name = "snp-ligase-core"
-version = "0.3.1"
+version = "0.3.5"
 dependencies = [
  "cosmic-text",
  "half",
@@ -4653,7 +4653,7 @@ dependencies = [
 
 [[package]]
 name = "snp-ligase-platform"
-version = "0.3.1"
+version = "0.3.5"
 dependencies = [
  "ashpd",
  "async-io",

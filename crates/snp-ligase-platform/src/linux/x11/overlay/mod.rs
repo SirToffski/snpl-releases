@@ -11,7 +11,7 @@
 //!
 //! What lives where:
 //!
-//! - [`state`] is the selection state machine, pure and unit-tested: press,
+//! - [`crate::selection`] is the selection state machine, pure and unit-tested: press,
 //!   move, release, Esc, right click, too small, crossing a monitor edge,
 //!   negative monitor origins.
 //! - [`paint`] decides the pixels of one overlay window, also pure: the dimmed
@@ -27,7 +27,6 @@
 pub mod child;
 pub mod paint;
 pub mod selfcheck;
-pub mod state;
 
 pub use child::run_child;
 

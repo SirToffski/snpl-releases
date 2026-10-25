@@ -13,7 +13,7 @@
 //!
 //! The one rule that matters more than any feature: **no overlay window may
 //! survive the call.** Cancel, error, timeout, or an early return from a failed
-//! `CreateWindowExW` — every path runs [`OverlayState::destroy_windows`], both
+//! `CreateWindowExW` — every path runs [`WindowGuard::destroy_windows`], both
 //! explicitly and from `Drop`. An invisible topmost window that swallows input
 //! is the worst failure this program could have.
 
@@ -31,10 +31,9 @@ use ::windows::Win32::Foundation::{
 };
 use ::windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, CreateSolidBrush, DEFAULT_GUI_FONT,
-    DIB_RGB_COLORS, EndPaint, FillRect, FrameRect, GetStockObject, GetTextExtentPoint32W, HBRUSH,
-    HDC, HFONT, HGDIOBJ, IntersectClipRect, InvalidateRect, NULLREGION, PAINTSTRUCT, RestoreDC,
-    SaveDC, SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TRANSPARENT, TextOutW,
-    UpdateWindow,
+    DIB_RGB_COLORS, EndPaint, FillRect, GetStockObject, GetTextExtentPoint32W, HBRUSH, HDC, HFONT,
+    HGDIOBJ, IntersectClipRect, InvalidateRect, NULLREGION, PAINTSTRUCT, RestoreDC, SaveDC,
+    SelectObject, SetBkMode, SetDIBitsToDevice, SetTextColor, TRANSPARENT, TextOutW, UpdateWindow,
 };
 use ::windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use ::windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -53,6 +52,7 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
 use ::windows::core::w;
 use image::RgbaImage;
 
+use crate::selection::{Outcome, SelectionState};
 use crate::{Error, RectI, Result, VirtualCapture};
 
 /// The overlay's window class. The self-check looks for windows of this class to
@@ -195,14 +195,7 @@ struct OverlayWindow {
 /// calling thread, with the pointer parked in each window's `GWLP_USERDATA`.
 struct OverlayState {
     windows: Vec<OverlayWindow>,
-    /// The current selection, in virtual-desktop pixels.
-    selection: Option<RectI>,
-    /// Where the drag started, in virtual-desktop pixels.
-    start: Option<(i32, i32)>,
-    dragging: bool,
-    /// Set once the user finished, or the overlay was cancelled or timed out.
-    finished: Option<RectI>,
-    cancelled: bool,
+    selection: SelectionState,
     black: HBRUSH,
     white: HBRUSH,
     cross: Option<HCURSOR>,
@@ -267,11 +260,7 @@ impl OverlayState {
         unsafe {
             Self {
                 windows,
-                selection: None,
-                start: None,
-                dragging: false,
-                finished: None,
-                cancelled: false,
+                selection: SelectionState::new(),
                 black: CreateSolidBrush(COLORREF(0x0000_0000)),
                 white: CreateSolidBrush(COLORREF(0x00FF_FFFF)),
                 cross: LoadCursorW(None, IDC_CROSS).ok(),
@@ -282,41 +271,57 @@ impl OverlayState {
             }
         }
     }
+}
 
-    /// Destroys every window. Idempotent, so both the explicit call and `Drop`
-    /// can run it.
+/// Lives inside `run`, after the boxed state, so it drops before that state.
+/// Only a raw pointer is retained: neither startup nor teardown holds a state
+/// borrow across a Win32 call that can synchronously re-enter `window_proc`.
+struct WindowGuard(*mut OverlayState);
+
+impl WindowGuard {
+    /// Destroys every window, including partial startup. Idempotent.
     fn destroy_windows(&mut self) {
-        for window in &mut self.windows {
-            destroy_window(window);
+        // Safety: the box in `run` outlives this guard. End the borrow before
+        // calling Win32; a callback can still arrive until all user data is clear.
+        let handles: Vec<_> = unsafe { &mut *self.0 }
+            .windows
+            .iter_mut()
+            .map(|window| std::mem::take(&mut window.hwnd))
+            .filter(|hwnd| !hwnd.is_invalid())
+            .collect();
+        destroy_windows(&handles);
+    }
+}
+
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        self.destroy_windows();
+    }
+}
+
+/// Clears ALL windows' state pointers before destroying any window.
+///
+/// `GWLP_USERDATA` is cleared **before** `DestroyWindow` (G5), so the window
+/// procedure sees a null state during `WM_DESTROY`/`WM_NCDESTROY` and can
+/// never reach state through another overlay window during re-entry either.
+/// Even a failed destruction leaves no pointer to the soon-to-be-freed state.
+fn destroy_windows(handles: &[HWND]) {
+    // Safety: all handles belong to this thread. No OverlayState reference is
+    // live here, and clearing user data itself sends no window messages.
+    unsafe {
+        for &hwnd in handles {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        }
+        for &hwnd in handles {
+            if let Err(err) = DestroyWindow(hwnd) {
+                tracing::error!(?hwnd, %err, "could not destroy an overlay window (state pointer cleared)");
+            }
         }
     }
 }
 
-/// Clears a window's state pointer and destroys the window.
-///
-/// `GWLP_USERDATA` is cleared **before** `DestroyWindow` (G5), so the window
-/// procedure sees a null state during `WM_DESTROY`/`WM_NCDESTROY` and can
-/// never touch the state while it is being torn down. The handle is dropped
-/// even when `DestroyWindow` fails, so a window that refused to die can never
-/// reach a freed `OverlayState` later either: the procedure reads the cleared
-/// pointer and falls through to `DefWindowProcW`.
-fn destroy_window(window: &mut OverlayWindow) {
-    if window.hwnd.is_invalid() {
-        return;
-    }
-    // Safety: clearing the pointer on and destroying our own window; the
-    // `DestroyWindow` result is ignored because a failure leaves nothing better
-    // to do than drop the handle.
-    unsafe {
-        SetWindowLongPtrW(window.hwnd, GWLP_USERDATA, 0);
-        let _ = DestroyWindow(window.hwnd);
-    }
-    window.hwnd = HWND::default();
-}
-
 impl Drop for OverlayState {
     fn drop(&mut self) {
-        self.destroy_windows();
         // Safety: freeing the GDI objects this state created. A NULL handle is
         // tolerated by DeleteObject through the HGDIOBJ conversion.
         unsafe {
@@ -346,6 +351,7 @@ unsafe fn run(capture: &VirtualCapture, timeout: Duration) -> Result<Option<Rect
 
     let mut state = Box::new(OverlayState::new(capture));
     let state_ptr: *mut OverlayState = &raw mut *state;
+    let mut windows = WindowGuard(state_ptr);
 
     // One window per monitor, exactly on it (SPEC 5.6).
     for index in 0..state.windows.len() {
@@ -373,10 +379,11 @@ unsafe fn run(capture: &VirtualCapture, timeout: Duration) -> Result<Option<Rect
     // Show every window, and put the one under the cursor in front so it
     // receives the keyboard (SPEC 5.6).
     let cursor = cursor_pos()?;
-    for window in &state.windows {
-        let _ = ShowWindow(window.hwnd, SW_SHOWNOACTIVATE);
-        let _ = InvalidateRect(Some(window.hwnd), None, false);
-        let _ = UpdateWindow(window.hwnd);
+    for index in 0..state.windows.len() {
+        let hwnd = state.windows[index].hwnd;
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        let _ = InvalidateRect(Some(hwnd), None, false);
+        let _ = UpdateWindow(hwnd);
     }
 
     // SPEC 12 M7's budget: hotkey to overlay visible. This is the time from
@@ -394,22 +401,22 @@ unsafe fn run(capture: &VirtualCapture, timeout: Duration) -> Result<Option<Rect
         .windows
         .iter()
         .find(|window| window.monitor.contains(cursor.0, cursor.1))
-        .or_else(|| state.windows.first());
+        .or_else(|| state.windows.first())
+        .map(|window| window.hwnd);
     if let Some(front) = front {
-        force_foreground(front.hwnd);
-        if timeout > Duration::ZERO {
-            SetTimer(
-                Some(front.hwnd),
-                TIMER_ID,
-                timeout.as_millis().min(u128::from(u32::MAX)) as u32,
-                None,
-            );
-        }
+        force_foreground(front);
+        let timer = SetTimer(
+            Some(front),
+            TIMER_ID,
+            timeout.as_millis().min(u128::from(u32::MAX)) as u32,
+            None,
+        );
+        require_timer(timer, &mut state.selection)?;
     }
 
     // The message loop: blocking, so nothing spins while the user decides.
     // Every decision (mouse up, Esc, right click, the safety timer) sets
-    // `finished` or `cancelled` from inside the window procedure. A failure
+    // the shared selection outcome from inside the window procedure. A failure
     // from `GetMessageW` is a cancel, never another message to dispatch (G5).
     let mut message = MSG::default();
     loop {
@@ -417,14 +424,14 @@ unsafe fn run(capture: &VirtualCapture, timeout: Duration) -> Result<Option<Rect
             MessageLoop::Message => {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
-                if state.cancelled || state.finished.is_some() {
+                if state.selection.outcome() != Outcome::Waiting {
                     break;
                 }
             }
             MessageLoop::Quit => break,
             MessageLoop::Error => {
                 tracing::warn!("the overlay's message loop failed; cancelling the overlay");
-                state.cancelled = true;
+                state.selection.timed_out();
                 break;
             }
         }
@@ -432,7 +439,7 @@ unsafe fn run(capture: &VirtualCapture, timeout: Duration) -> Result<Option<Rect
 
     // The windows go before the caller sees anything, and `Drop` is the belt to
     // this pair of braces. A message-loop failure with no decision is a cancel.
-    state.destroy_windows();
+    windows.destroy_windows();
     if state.paints > 0 {
         let average = state.paint_total.as_secs_f64() * 1000.0 / f64::from(state.paints);
         tracing::info!(
@@ -442,11 +449,24 @@ unsafe fn run(capture: &VirtualCapture, timeout: Duration) -> Result<Option<Rect
             "overlay paints"
         );
     }
-    if state.cancelled || state.finished.is_none() {
-        Ok(None)
-    } else {
-        Ok(state.finished)
+    match state.selection.outcome() {
+        Outcome::Selected(rect) => Ok(Some(rect)),
+        Outcome::Waiting | Outcome::Cancelled => Ok(None),
     }
+}
+
+/// SetTimer returns zero on failure. Never enter a blocking loop without the
+/// safety timer; the caller's guard tears down all windows on this error.
+fn require_timer(timer: usize, selection: &mut SelectionState) -> Result<()> {
+    if timer == 0 {
+        selection.timed_out();
+        tracing::error!("could not create the region overlay safety timer; cancelling the overlay");
+        return Err(Error::Os {
+            message: "could not create the region overlay safety timer (SetTimer returned 0)"
+                .to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Registers the overlay's window class, once per process.
@@ -534,17 +554,23 @@ unsafe extern "system" fn window_proc(
     if state_ptr.is_null() {
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
-    let state = &mut *state_ptr;
-
+    // Keep the pointer raw until a branch needs it. In particular SetCapture,
+    // ReleaseCapture, BeginPaint and DefWindowProcW can synchronously call us
+    // again. No mutable reference to the state may survive any of those calls.
     match message {
         WM_PAINT => {
             let mut paint = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut paint);
-            let index = state.windows.iter().position(|window| window.hwnd == hwnd);
+            let index = (*state_ptr)
+                .windows
+                .iter()
+                .position(|window| window.hwnd == hwnd);
             if let Some(index) = index {
                 let started = std::time::Instant::now();
-                paint_window(state, index, hdc);
-                state.record_paint(started.elapsed());
+                // Only GDI bitmap/text calls inside paint_window; no message
+                // dispatch. The shared borrow ends before recording timing.
+                paint_window(&*state_ptr, index, hdc);
+                (*state_ptr).record_paint(started.elapsed());
             }
             let _ = EndPaint(hwnd, &paint);
             LRESULT(0)
@@ -555,7 +581,7 @@ unsafe extern "system" fn window_proc(
             LRESULT(1)
         }
         WM_SETCURSOR => {
-            if let Some(cross) = state.cross {
+            if let Some(cross) = (*state_ptr).cross {
                 SetCursor(Some(cross));
             }
             LRESULT(1)
@@ -564,65 +590,59 @@ unsafe extern "system" fn window_proc(
             // Capture so the drag keeps reporting when it leaves a monitor.
             SetCapture(hwnd);
             if let Ok((x, y)) = cursor_pos() {
-                state.dragging = true;
-                state.start = Some((x, y));
-                let old = state.selection;
-                state.selection = Some(RectI { x, y, w: 0, h: 0 });
-                invalidate_change(state, old, state.selection);
+                change_selection(state_ptr, |selection| selection.press(x, y));
             }
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
-            if state.dragging
-                && let Ok((x, y)) = cursor_pos()
-            {
-                let old = state.selection;
-                let start = state.start.unwrap_or((x, y));
-                state.selection = Some(RectI::new(start.0, start.1, x - start.0, y - start.1));
-                invalidate_change(state, old, state.selection);
+            if let Ok((x, y)) = cursor_pos() {
+                change_selection(state_ptr, |selection| selection.pointer_moved(x, y));
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             let _ = ReleaseCapture();
-            state.dragging = false;
             // The release position is the last word, even if no move event
             // arrived after it.
-            if let Some(start) = state.start
-                && let Ok((x, y)) = cursor_pos()
-            {
-                state.selection = Some(RectI::new(start.0, start.1, x - start.0, y - start.1));
-            }
-            // SPEC 5.6: at least 3x3 pixels, or the overlay keeps waiting.
-            let small = state
-                .selection
-                .is_none_or(|selection| selection.w < 3 || selection.h < 3);
-            if small {
-                let old = state.selection;
-                state.selection = None;
-                state.start = None;
-                invalidate_change(state, old, None);
-            } else {
-                state.finished = state.selection;
+            if let Ok((x, y)) = cursor_pos() {
+                change_selection(state_ptr, |selection| {
+                    selection.release(x, y);
+                });
             }
             LRESULT(0)
         }
         WM_RBUTTONDOWN => {
-            state.cancelled = true;
+            (*state_ptr).selection.right_click();
             LRESULT(0)
         }
         WM_KEYDOWN => {
             if wparam.0 as u16 == VK_ESCAPE.0 {
-                state.cancelled = true;
+                (*state_ptr).selection.escape();
             }
             LRESULT(0)
         }
         WM_TIMER => {
-            tracing::warn!("the region overlay timed out");
-            state.cancelled = true;
+            if wparam.0 == TIMER_ID {
+                tracing::warn!("the region overlay timed out");
+                (*state_ptr).selection.timed_out();
+            }
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+/// Apply only pure state changes while mutably borrowed, then repaint after
+/// that borrow ends. The pointer has the same lifetime as in `window_proc`.
+unsafe fn change_selection(state_ptr: *mut OverlayState, change: impl FnOnce(&mut SelectionState)) {
+    let (old, new) = {
+        let selection = &mut (*state_ptr).selection;
+        let old = selection.selection();
+        change(selection);
+        (old, selection.selection())
+    };
+    if old != new {
+        invalidate_change(&*state_ptr, old, new);
     }
 }
 
@@ -693,7 +713,7 @@ unsafe fn paint_window(state: &OverlayState, index: usize, hdc: HDC) {
     }
     blit(hdc, &window.dimmed);
 
-    let Some(selection) = state.selection else {
+    let Some(selection) = state.selection.selection() else {
         if saved != 0 {
             let _ = RestoreDC(hdc, saved);
         }
@@ -702,13 +722,6 @@ unsafe fn paint_window(state: &OverlayState, index: usize, hdc: HDC) {
     let local = selection
         .intersection(window.monitor)
         .to_local(window.monitor);
-    if local.is_empty() {
-        if saved != 0 {
-            let _ = RestoreDC(hdc, saved);
-        }
-        return;
-    }
-
     // The bright part: the original pixels, clipped to the selection.
     let inner = SaveDC(hdc);
     if IntersectClipRect(hdc, local.x, local.y, local.right(), local.bottom()) != NULLREGION {
@@ -719,26 +732,22 @@ unsafe fn paint_window(state: &OverlayState, index: usize, hdc: HDC) {
     }
 
     // A white line on the selection's edge, with a black line around it.
-    FrameRect(
-        hdc,
-        &RECT {
-            left: local.x - 1,
-            top: local.y - 1,
-            right: local.right() + 1,
-            bottom: local.bottom() + 1,
-        },
-        state.black,
-    );
-    FrameRect(
-        hdc,
-        &RECT {
-            left: local.x,
-            top: local.y,
-            right: local.right(),
-            bottom: local.bottom(),
-        },
-        state.white,
-    );
+    // Clip the real edges to this monitor, never outline the intersection:
+    // that would introduce a false vertical/horizontal line at a monitor seam.
+    for (offset, brush) in [(1, state.black), (0, state.white)] {
+        for edge in outline_edges(selection, window.monitor, offset) {
+            FillRect(
+                hdc,
+                &RECT {
+                    left: edge.x,
+                    top: edge.y,
+                    right: edge.right(),
+                    bottom: edge.bottom(),
+                },
+                brush,
+            );
+        }
+    }
 
     // The size label, on the monitor that owns the selection's top-left corner,
     // so a selection spanning two monitors shows it exactly once.
@@ -749,6 +758,29 @@ unsafe fn paint_window(state: &OverlayState, index: usize, hdc: HDC) {
     if saved != 0 {
         let _ = RestoreDC(hdc, saved);
     }
+}
+
+/// One-pixel outline strips in monitor-local coordinates. Construct the full
+/// outline BEFORE clipping, so even an outer black edge just across a monitor
+/// boundary belongs to the neighboring monitor rather than disappearing.
+fn outline_edges(selection: RectI, monitor: RectI, offset: i32) -> Vec<RectI> {
+    if selection.is_empty() {
+        return Vec::new();
+    }
+    let left = selection.x - offset;
+    let top = selection.y - offset;
+    let right = selection.right() + offset;
+    let bottom = selection.bottom() + offset;
+    [
+        RectI::new(left, top, 1, bottom - top),
+        RectI::new(right - 1, top, 1, bottom - top),
+        RectI::new(left, top, right - left, 1),
+        RectI::new(left, bottom - 1, right - left, 1),
+    ]
+    .into_iter()
+    .map(|edge| edge.intersection(monitor).to_local(monitor))
+    .filter(|edge| !edge.is_empty())
+    .collect()
 }
 
 /// Draws `W × H` near the selection's top-left corner (SPEC 5.6).
@@ -896,7 +928,97 @@ fn union(a: Option<RectI>, b: Option<RectI>) -> Option<RectI> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Windows review's finding 1: every drag direction gives the same
+    /// selection, not only down-right.
+    #[test]
+    fn a_drag_selects_the_same_rectangle_in_every_direction() {
+        let expected = RectI::new(100, 50, 400, 300);
+        for (start, end) in [
+            ((100, 50), (500, 350)), // down-right
+            ((500, 350), (100, 50)), // up-left
+            ((500, 50), (100, 350)), // down-left
+            ((100, 350), (500, 50)), // up-right
+        ] {
+            let mut selection = SelectionState::new();
+            selection.press(start.0, start.1);
+            selection.pointer_moved(end.0, end.1);
+            assert!(selection.release(end.0, end.1));
+            assert_eq!(
+                selection.outcome(),
+                Outcome::Selected(expected),
+                "{start:?} -> {end:?}"
+            );
+        }
+        let mut selection = SelectionState::new();
+        selection.press(7, 7);
+        assert!(!selection.release(7, 7));
+        assert_eq!(selection.outcome(), Outcome::Waiting);
+    }
     use image::Rgba;
+
+    #[test]
+    fn a_missing_safety_timer_cancels_instead_of_waiting_forever() {
+        let mut selection = SelectionState::new();
+        assert!(require_timer(1, &mut selection).is_ok());
+        assert_eq!(selection.outcome(), Outcome::Waiting);
+        selection.press(10, 10);
+        let err = require_timer(0, &mut selection).unwrap_err();
+        assert!(err.to_string().contains("SetTimer returned 0"));
+        assert_eq!(selection.outcome(), Outcome::Cancelled);
+        assert!(!selection.release(100, 100));
+    }
+
+    #[test]
+    fn spanning_outlines_have_no_edges_at_monitor_seams() {
+        let selection = RectI::new(-30, -20, 60, 40);
+        // Horizontal and vertical seams, negative origins, and a monitor
+        // wholly inside the selection. Compare pixels with the full outline.
+        for monitor in [
+            RectI::new(-100, -100, 100, 200),
+            RectI::new(0, -100, 100, 200),
+            RectI::new(-100, -100, 200, 100),
+            RectI::new(-100, 0, 200, 100),
+            RectI::new(-10, -10, 20, 20),
+        ] {
+            for offset in [0, 1] {
+                let edges = outline_edges(selection, monitor, offset);
+                for y in monitor.y..monitor.bottom() {
+                    for x in monitor.x..monitor.right() {
+                        let left = selection.x - offset;
+                        let right = selection.right() - 1 + offset;
+                        let top = selection.y - offset;
+                        let bottom = selection.bottom() - 1 + offset;
+                        let expected = ((x == left || x == right) && (top..=bottom).contains(&y))
+                            || ((y == top || y == bottom) && (left..=right).contains(&x));
+                        let painted = edges
+                            .iter()
+                            .any(|edge| edge.contains(x - monitor.x, y - monitor.y));
+                        assert_eq!(
+                            painted, expected,
+                            "{monitor:?}, offset {offset}, ({x}, {y})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_outer_outline_can_land_on_the_neighboring_monitor() {
+        let selection = RectI::new(0, 10, 30, 40);
+        let neighbor = RectI::new(-100, 0, 100, 100);
+        assert!(outline_edges(selection, neighbor, 0).is_empty());
+        assert_eq!(
+            outline_edges(selection, neighbor, 1),
+            vec![
+                RectI::new(99, 9, 1, 42),
+                RectI::new(99, 9, 1, 1),
+                RectI::new(99, 50, 1, 1),
+            ]
+        );
+        assert!(outline_edges(RectI::new(0, 0, 0, 5), neighbor, 1).is_empty());
+    }
 
     #[test]
     fn the_dimmed_copy_uses_the_spec_factor() {
@@ -1101,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn destroying_a_window_clears_its_state_pointer_first() {
+    fn timer_failure_destroys_all_windows_with_all_state_pointers_cleared_first() {
         // G5: the window procedure must never see the state pointer during
         // destruction, or a torn-down `OverlayState` could be used after it was
         // freed. A real window is created for this, and its procedure records
@@ -1110,6 +1232,8 @@ mod tests {
         use std::sync::atomic::{AtomicIsize, Ordering};
 
         static SEEN: AtomicIsize = AtomicIsize::new(-1);
+        static OTHER: AtomicIsize = AtomicIsize::new(0);
+        static SEEN_OTHER: AtomicIsize = AtomicIsize::new(-1);
 
         unsafe extern "system" fn test_proc(
             hwnd: HWND,
@@ -1119,6 +1243,13 @@ mod tests {
         ) -> LRESULT {
             if message == WM_NCDESTROY {
                 SEEN.store(GetWindowLongPtrW(hwnd, GWLP_USERDATA), Ordering::SeqCst);
+                let other = OTHER.load(Ordering::SeqCst);
+                if other != 0 && hwnd.0 as isize != other {
+                    SEEN_OTHER.store(
+                        GetWindowLongPtrW(HWND(other as *mut _), GWLP_USERDATA),
+                        Ordering::SeqCst,
+                    );
+                }
             }
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
@@ -1135,7 +1266,7 @@ mod tests {
         let atom = unsafe { RegisterClassW(&raw const class) };
         assert_ne!(atom, 0, "the test window class could not be registered");
 
-        let hwnd = unsafe {
+        let create_window = || unsafe {
             CreateWindowExW(
                 WS_EX_TOOLWINDOW,
                 w!("snp_ligase_overlay_destroy_test"),
@@ -1150,26 +1281,54 @@ mod tests {
                 Some(instance),
                 None,
             )
-        }
-        .expect("the test window could not be created");
-        // Safety: our own window; the value only has to be non-zero.
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 42);
-        }
-
-        let mut window = OverlayWindow {
-            hwnd,
-            monitor: RectI::new(0, 0, 10, 10),
-            original: Dib::new(Vec::new(), 0, 0),
-            dimmed: Dib::new(Vec::new(), 0, 0),
         };
-        destroy_window(&mut window);
-
-        assert!(window.hwnd.is_invalid(), "the handle was not cleared");
+        let handles = [
+            create_window().expect("the first test window could not be created"),
+            create_window().expect("the second test window could not be created"),
+        ];
+        OTHER.store(handles[1].0 as isize, Ordering::SeqCst);
+        let mut state = Box::new(OverlayState::new(&VirtualCapture::default()));
+        for hwnd in handles {
+            // Safety: our own window; the value only has to be non-zero.
+            unsafe {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 42);
+            }
+            state.windows.push(OverlayWindow {
+                hwnd,
+                monitor: RectI::new(0, 0, 10, 10),
+                original: Dib::new(Vec::new(), 0, 0),
+                dimmed: Dib::new(Vec::new(), 0, 0),
+            });
+        }
+        // Exercise the actual early-return path: the guard must run when
+        // the safety timer is unavailable, before the state can be freed.
+        let result = (|| {
+            let _guard = WindowGuard(&raw mut *state);
+            require_timer(0, &mut state.selection)?;
+            Ok::<(), Error>(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(state.selection.outcome(), Outcome::Cancelled);
+        assert!(
+            state.windows.iter().all(|window| window.hwnd.is_invalid()),
+            "the handle was not cleared"
+        );
         assert_eq!(
             SEEN.load(Ordering::SeqCst),
             0,
             "the window procedure saw a state pointer during destruction"
+        );
+        assert_eq!(
+            SEEN_OTHER.load(Ordering::SeqCst),
+            0,
+            "another overlay window still had a state pointer during destruction"
+        );
+        assert!(
+            handles.iter().all(|&hwnd| !unsafe {
+                ::windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd))
+            }
+            .as_bool()),
+            "a window survived the timer failure"
         );
     }
 }

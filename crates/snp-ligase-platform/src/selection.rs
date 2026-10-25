@@ -2,8 +2,8 @@
 //!
 //! Everything the overlay decides — when a drag starts, which rectangle is
 //! being dragged, when a drag is big enough to count, when Esc or a right click
-//! cancels — is here, as a plain state machine over **root-window pixels**.
-//! The winit windows ([`super::child`]) only turn events into calls, so a
+//! cancels — is here, as a plain state machine over **virtual-desktop pixels**.
+//! The Windows, X11 and Wayland windows only turn events into calls, so a
 //! monitor edge, a negative monitor origin or a drag that leaves the monitor it
 //! started on are tests, not clicks.
 //!
@@ -33,12 +33,12 @@ pub enum Outcome {
     Cancelled,
 }
 
-/// The overlay's selection state, in root-window pixels.
+/// The overlay's selection state, in virtual-desktop pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SelectionState {
     /// Where the left button went down, while a drag is in progress.
     start: Option<(i32, i32)>,
-    /// The last pointer position seen, in root-window pixels.
+    /// The last pointer position seen, in virtual-desktop pixels.
     pointer: (i32, i32),
     outcome: Outcome,
 }
@@ -114,11 +114,9 @@ impl SelectionState {
         self.cancel();
     }
 
-    /// The rectangle being dragged right now, in root-window pixels.
+    /// The rectangle being dragged right now, in virtual-desktop pixels.
     ///
-    /// `None` while no button is down, or when the drag is too small to be
-    /// worth showing — the Windows overlay tracks a 0×0 rectangle from the
-    /// press instead, which is invisible either way.
+    /// `None` while no button is down, or when the drag has zero area.
     #[must_use]
     pub fn selection(&self) -> Option<RectI> {
         match self.outcome {
@@ -287,7 +285,7 @@ mod tests {
     #[test]
     fn a_drag_that_crosses_a_monitor_edge_is_one_rectangle() {
         // Two 960-pixel monitors side by side: the overlay does not care where
-        // the edges are, the painter clips per monitor (`super::paint`).
+        // the edges are; each backend's painter clips per monitor.
         let mut state = SelectionState::new();
         state.press(900, 500);
         state.pointer_moved(1200, 700);

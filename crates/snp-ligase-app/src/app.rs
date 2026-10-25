@@ -906,6 +906,7 @@ impl SnpLigaseApp {
         self.controller.send(AppCommand::Configure(CaptureSettings {
             copy_new_captures: draft.copy_new_captures,
             hide_while_capturing: draft.hide_while_capturing,
+            show_editor_after_capture: draft.show_editor_after_capture,
             include_cursor: draft.include_cursor,
             hdr_highlights: draft.hdr_highlights,
             sdr_white_nits: draft.sdr_white_nits,
@@ -1013,6 +1014,11 @@ impl SnpLigaseApp {
         // keys (the draft is not saved until OK).
         self.recording = None;
         match outcome {
+            Recorded::Rejected(reason) => {
+                tracing::warn!(mode = mode.label(), reason, "hotkey recording refused");
+                self.settings_warnings.push(reason.to_owned());
+                self.report(reason.to_owned());
+            }
             Recorded::Hotkey(hotkey) => {
                 let text = crate::hotkeys::display_hotkey(&hotkey);
                 if let Some(draft) = self.settings_draft.as_mut() {
@@ -2029,6 +2035,25 @@ impl SnpLigaseApp {
             Action::Save => self.action_save(false),
             Action::SaveAs => self.action_save(true),
             Action::SaveAll => self.action_save_all(),
+            Action::ShowInExplorer(index) => {
+                let path = self
+                    .tabs
+                    .get(index)
+                    .and_then(Tab::path)
+                    .map(Path::to_path_buf);
+                if let Some(reason) = crate::explorer::blocked(path.as_deref()) {
+                    self.report(reason.to_owned());
+                } else if let Some(path) = path {
+                    tracing::info!(path = %path.display(), "show file in Explorer");
+                    match crate::explorer::show(&path) {
+                        Ok(()) => self.report(format!("Showing {} in Explorer.", path.display())),
+                        Err(err) => self.report(format!(
+                            "Could not show {} in Explorer: {err}",
+                            path.display()
+                        )),
+                    }
+                }
+            }
             Action::CopyImage => self.action_copy(),
             Action::CloseTab(index) => {
                 // Ctrl+W has no index yet: it means "this tab".
@@ -2517,15 +2542,39 @@ impl SnpLigaseApp {
     }
 }
 
+impl SnpLigaseApp {
+    /// The work that must not wait for a visible frame (WIN1): the
+    /// controller's events (new captures and their clipboard copy), the
+    /// clipboard retry, finished saves.
+    ///
+    /// eframe runs `logic` before every frame's `ui` and, while the window is
+    /// minimized or hidden in the tray, on logic-only ticks instead (at most
+    /// every 100 ms, when one is asked for). Before WIN1 this ran only in
+    /// `ui`, so on Windows a capture taken with the editor in the taskbar was
+    /// not copied, saved or opened until the window came back.
+    fn background_tick(&mut self, ctx: &egui::Context) {
+        self.controller
+            .window()
+            .record_minimized(ctx.input(|i| i.viewport().minimized.unwrap_or(false)));
+        // The controller thread may have finished a capture while no frame was
+        // running — that is the whole point of it (SPEC 6.2) — so its queue is
+        // drained before anything is drawn.
+        self.drain_controller_events();
+        self.retry_capture_copy(std::time::Instant::now());
+        if self.capture_copy.is_some() {
+            ctx.request_repaint_after(CAPTURE_COPY_RETRY);
+        }
+        self.drain_saves();
+    }
+}
+
 impl App for SnpLigaseApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // eframe skips `ui` while minimized. Captures and attention/activation
-        // still need to finish, so Wayland handles them in the hidden tick.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         #[cfg(target_os = "linux")]
         if self.controller.window().is_wayland() {
             self.controller.window().attach_surface(_frame);
-            self.drain_controller_events();
         }
+        self.background_tick(ctx);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
@@ -2602,15 +2651,9 @@ impl SnpLigaseApp {
             }
             _ => {}
         }
-        // The controller thread may have finished a capture while no frame was
-        // running — that is the whole point of it (SPEC 6.2) — so its queue is
-        // drained before anything is drawn.
-        self.drain_controller_events();
-        self.retry_capture_copy(std::time::Instant::now());
-        if self.capture_copy.is_some() {
-            ctx.request_repaint_after(CAPTURE_COPY_RETRY);
-        }
-        self.drain_saves();
+        // Normally done already by this frame's `logic`; tests drive
+        // `frame_ui` directly, and a second run in one frame finds nothing.
+        self.background_tick(&ctx);
         self.poll_fonts();
         self.open_pending();
         self.open_dropped(&ctx);
@@ -2903,6 +2946,7 @@ impl SnpLigaseApp {
         let capture_hotkeys =
             shortcuts::capture_bindings(settings, self.capabilities.global_hotkeys);
         MenuState {
+            explorer_blocked: crate::explorer::unavailable(tab.and_then(Tab::path)),
             can_undo: tab.is_some_and(Tab::can_undo),
             can_redo: tab.is_some_and(Tab::can_redo),
             has_tab: tab.is_some(),
@@ -6367,6 +6411,42 @@ mod tests {
 
     fn stored_bindings(app: &SnpLigaseApp) -> Vec<crate::hotkeys::Binding> {
         crate::hotkeys::bindings_from(app.settings.settings()).0
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win3_refused_recording_keeps_the_draft_and_restores_bindings() {
+        let mut app = app();
+        start_recording(&mut app, CaptureMode::Region);
+        let original = app
+            .settings_draft
+            .as_ref()
+            .unwrap()
+            .hotkey_text(CaptureMode::Region)
+            .to_owned();
+        let stored = stored_bindings(&app);
+        app.poll_hotkey_recording(&snapshot(&[0x92], true, false));
+        assert!(app.recording.is_none());
+        assert_eq!(
+            app.settings_draft
+                .as_ref()
+                .unwrap()
+                .hotkey_text(CaptureMode::Region),
+            original
+        );
+        assert!(app.status.contains("Numpad Equal"));
+        assert!(
+            app.settings_warnings
+                .iter()
+                .any(|message| message.contains("E key"))
+        );
+        assert!(
+            app.hotkeys
+                .borrow()
+                .rebind_log()
+                .iter()
+                .any(|bindings| bindings == &stored)
+        );
     }
 
     /// NEXT_STEPS step 7: the recording guard re-registers the stored hotkeys

@@ -84,6 +84,8 @@ pub struct CaptureSettings {
     pub copy_new_captures: bool,
     /// Hide the window while a capture is taken.
     pub hide_while_capturing: bool,
+    /// Bring the editor to the front after a successful capture (WIN1).
+    pub show_editor_after_capture: bool,
     /// Include the mouse cursor in captures.
     pub include_cursor: bool,
     /// What to do with values above SDR white on an HDR monitor.
@@ -97,6 +99,7 @@ impl Default for CaptureSettings {
         Self {
             copy_new_captures: true,
             hide_while_capturing: true,
+            show_editor_after_capture: true,
             include_cursor: false,
             hdr_highlights: HdrHighlights::Clip,
             sdr_white_nits: None,
@@ -167,6 +170,10 @@ pub struct WindowGate {
     visible: AtomicBool,
     wayland: AtomicBool,
     focused: AtomicBool,
+    /// Whether the window is minimized to the taskbar, as the UI saw it on its
+    /// last tick (WIN1). `visible` cannot tell: a minimized window is still
+    /// "shown". Never set on Wayland, which cannot tell either.
+    minimized: AtomicBool,
     pub clipboard: crate::clipboard::ClipboardHandle,
     auto_save: std::sync::Mutex<Option<crate::settings::Settings>>,
     pub save_claims: std::sync::Mutex<std::collections::HashSet<std::path::PathBuf>>,
@@ -178,6 +185,9 @@ pub struct WindowGate {
     /// difference (LINUX_SUPPORT.md section 3, item 2).
     #[cfg(test)]
     hides: AtomicUsize,
+    /// How many times a show was asked for (WIN1 tests).
+    #[cfg(test)]
+    shows: AtomicUsize,
 }
 
 impl Default for WindowGate {
@@ -187,6 +197,7 @@ impl Default for WindowGate {
             visible: AtomicBool::new(true),
             wayland: AtomicBool::new(false),
             focused: AtomicBool::new(false),
+            minimized: AtomicBool::new(false),
             clipboard: crate::clipboard::ClipboardHandle::default(),
             auto_save: std::sync::Mutex::new(None),
             save_claims: std::sync::Mutex::default(),
@@ -194,6 +205,8 @@ impl Default for WindowGate {
             surface: std::sync::Mutex::new(None),
             #[cfg(test)]
             hides: AtomicUsize::new(0),
+            #[cfg(test)]
+            shows: AtomicUsize::new(0),
         }
     }
 }
@@ -261,6 +274,18 @@ impl WindowGate {
         self.focused.store(focused, Ordering::Relaxed);
     }
 
+    /// Records whether the window is minimized; the UI calls it every tick,
+    /// including the logic-only ticks eframe runs while it is minimized.
+    pub fn record_minimized(&self, minimized: bool) {
+        self.minimized.store(minimized, Ordering::Relaxed);
+    }
+
+    /// Whether the window was minimized on the UI's last tick (WIN1).
+    #[must_use]
+    pub fn is_minimized(&self) -> bool {
+        self.minimized.load(Ordering::Relaxed)
+    }
+
     fn should_hide(&self) -> bool {
         !self.is_wayland() || self.focused.load(Ordering::Relaxed)
     }
@@ -298,6 +323,13 @@ impl WindowGate {
         self.hides.load(Ordering::Relaxed)
     }
 
+    /// How many times a show was asked for (WIN1 tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn show_count(&self) -> usize {
+        self.shows.load(Ordering::Relaxed)
+    }
+
     /// Shows and focuses the main window, and makes sure a frame runs so the
     /// UI can drain its event queue (SPEC 6.3).
     pub fn show(&self) {
@@ -308,6 +340,8 @@ impl WindowGate {
         // Set before the early return: the flag is what a cancelled capture
         // restores (G4), and tests drive it without an attached UI.
         self.visible.store(true, Ordering::Relaxed);
+        #[cfg(test)]
+        self.shows.fetch_add(1, Ordering::Relaxed);
         let Some(context) = self.context.get() else {
             tracing::warn!("asked to show a window that is not attached to a UI yet");
             return;
@@ -326,6 +360,12 @@ impl WindowGate {
             }
         }
         context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        // WIN1: winit's Windows `focus_window` does nothing for a minimized
+        // window, so a capture taken with the editor in the taskbar left it
+        // there. Restore it first; a normal or maximized window keeps its
+        // placement.
+        #[cfg(windows)]
+        context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         context.send_viewport_cmd(egui::ViewportCommand::Focus);
         context.request_repaint();
     }
@@ -805,11 +845,19 @@ impl Worker {
             self.fail(format!("Capture failed: {reason}"));
             return;
         }
+        // G4: remember where the window was before the capture. Pressing Print
+        // Screen while the app lives in the tray and then pressing Esc must not
+        // pop the window up. WIN1: the same for the taskbar.
+        let was_visible = self.window.is_visible();
+        let was_minimized = self.window.is_minimized();
         // Hiding is a capability of its own: a platform that cannot hide the
         // window (Wayland, LINUX_SUPPORT.md section 2) captures anyway if the
-        // rest works.
+        // rest works. A window in the tray or the taskbar is not on screen,
+        // so it is not hidden (and nothing waits for it to leave).
         let hide = self.settings.hide_while_capturing
             && capabilities.hide_main_window
+            && was_visible
+            && !was_minimized
             && self.window.should_hide()
             // KWin picks these targets itself; minimizing the editor first
             // would change which window is active (W3).
@@ -820,13 +868,11 @@ impl Worker {
                 ));
         tracing::info!(
             hide,
+            was_visible,
+            was_minimized,
             focused = self.window.focused.load(Ordering::Relaxed),
             "capture window decision"
         );
-        // G4: remember where the window was before the capture. Pressing Print
-        // Screen while the app lives in the tray and then pressing Esc must not
-        // pop the window up.
-        let was_visible = self.window.is_visible();
         if hide {
             self.window.hide();
         }
@@ -921,14 +967,22 @@ impl Worker {
                     "opening the region overlay"
                 );
                 match self.select_region(&capture, &mut token) {
-                    Some(region) => region,
-                    None => {
+                    Ok(Some(region)) => region,
+                    Err(err) => {
+                        self.fail(format!("Region selection failed: {err}"));
+                        return;
+                    }
+                    Ok(None) => {
                         tracing::info!("the region selection was cancelled");
                         self.emit(UiEvent::Status("Capture cancelled.".to_owned()));
-                        if was_visible && !self.window.is_wayland() {
+                        // Put back only what this capture changed: a window it
+                        // hid comes back; one in the tray or the taskbar stays.
+                        if hide && !self.window.is_wayland() {
                             self.window.show();
                         } else {
-                            tracing::debug!("the window stays hidden after the cancelled capture");
+                            tracing::debug!(
+                                "the window stays as it was after the cancelled capture"
+                            );
                         }
                         return;
                     }
@@ -1021,7 +1075,22 @@ impl Worker {
         } else {
             self.emit(UiEvent::NewCapture(image));
         }
-        self.window.show();
+        self.present_after_capture(hide);
+    }
+
+    /// Brings the editor back after a successful capture (SPEC 6.3, WIN1).
+    ///
+    /// "Show editor after capture" on (the default): always to the front,
+    /// restored from the taskbar or the tray. Off: only a window this capture
+    /// hid comes back; one that was in the taskbar or the tray stays there,
+    /// while the capture is still copied and auto-saved. Linux keeps showing
+    /// it every time until its own pass (the setting is Windows-only so far).
+    fn present_after_capture(&mut self, hidden: bool) {
+        if self.settings.show_editor_after_capture || !cfg!(windows) || hidden {
+            self.window.show();
+        } else {
+            tracing::info!("the editor stays where it was (Show editor after capture is off)");
+        }
     }
 
     /// Sends an event to the UI and makes sure a frame runs to drain it (G2).
@@ -1040,7 +1109,7 @@ impl Worker {
         &mut self,
         capture: &VirtualCapture,
         token: &mut Option<String>,
-    ) -> Option<RectI> {
+    ) -> snp_ligase_platform::Result<Option<RectI>> {
         // Input in the overlay invalidates any older launch permission.
         *token = None;
         let selected = self.platform.select_region_activated(capture);
@@ -1052,15 +1121,17 @@ impl Worker {
                 activation_token,
             }) => {
                 *token = activation_token;
-                self.window.show_activated(token.take());
+                // Wayland: the overlay's token is fresh only now, so use it at
+                // once (W2). Elsewhere the editor is presented once, after the
+                // capture, by `present_after_capture`.
+                if self.window.is_wayland() {
+                    self.window.show_activated(token.take());
+                }
                 self.last_region = Some(region);
-                Some(region)
+                Ok(Some(region))
             }
-            Ok(_) => None,
-            Err(err) => {
-                self.fail(format!("Region selection failed: {err}"));
-                None
-            }
+            Ok(_) => Ok(None),
+            Err(err) => Err(err),
         }
     }
 
@@ -1718,6 +1789,75 @@ mod tests {
         )
     }
 
+    /// WIN1: how the editor is presented after a capture, for every state it
+    /// can start in. "Show editor after capture" on brings it to the front
+    /// from anywhere; off puts back only what the capture changed. Linux shows
+    /// it every time until its own pass.
+    #[test]
+    fn win1_the_editor_is_presented_after_a_capture_by_the_setting() {
+        #[derive(Debug, Clone, Copy)]
+        enum Start {
+            OnScreen,
+            Minimized,
+            InTray,
+        }
+        let windows = cfg!(windows);
+        // (start, mode, select, setting on) -> (hidden for the capture, shown after)
+        let cases = [
+            (Start::OnScreen, CaptureMode::AllMonitors, true, true, true),
+            (Start::OnScreen, CaptureMode::AllMonitors, false, true, true),
+            (
+                Start::Minimized,
+                CaptureMode::AllMonitors,
+                true,
+                false,
+                true,
+            ),
+            (
+                Start::Minimized,
+                CaptureMode::AllMonitors,
+                false,
+                false,
+                !windows,
+            ),
+            (Start::InTray, CaptureMode::AllMonitors, true, false, true),
+            (
+                Start::InTray,
+                CaptureMode::AllMonitors,
+                false,
+                false,
+                !windows,
+            ),
+            // A cancelled region puts back only what the capture changed,
+            // whatever the setting says.
+            (Start::OnScreen, CaptureMode::Region, true, true, true),
+            (Start::Minimized, CaptureMode::Region, true, false, false),
+            (Start::InTray, CaptureMode::Region, true, false, false),
+        ];
+        for (start, mode, setting, hidden, shown) in cases {
+            let window = Arc::new(WindowGate::default());
+            match start {
+                Start::OnScreen => {}
+                Start::Minimized => window.record_minimized(true),
+                Start::InTray => window.hide(),
+            }
+            let hides_before = window.hide_count();
+            let (mut worker, _events) =
+                worker(Arc::new(FakePlatform::new(Select::Cancel)), &window);
+            worker.settings.show_editor_after_capture = setting;
+
+            worker.capture(mode, 0);
+
+            let case = format!("{start:?}, {}, setting {setting}", mode.label());
+            assert_eq!(
+                window.hide_count() - hides_before > 0,
+                hidden,
+                "hidden for the capture: {case}"
+            );
+            assert_eq!(window.show_count() > 0, shown, "shown afterwards: {case}");
+        }
+    }
+
     #[test]
     fn a_cancelled_capture_leaves_a_hidden_window_hidden() {
         // G4: pressing Print Screen while the app lives in the tray and then
@@ -1839,6 +1979,21 @@ mod tests {
     }
 
     #[test]
+    fn win3_region_error_is_not_followed_by_cancelled_status() {
+        let platform: Arc<dyn Platform> = Arc::new(FakePlatform::new(Select::Fail));
+        let window = Arc::new(WindowGate::default());
+        let (mut worker, events) = worker(platform, &window);
+        worker.capture(CaptureMode::Region, 0);
+        let events: Vec<_> = events.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(event,
+            UiEvent::Warning(message) if message.contains("the fake overlay refused"))));
+        assert!(!events.iter().any(|event| matches!(event,
+            UiEvent::Status(message) if message.contains("cancelled"))));
+        assert!(window.is_visible());
+        assert_eq!(worker.last_region, None);
+    }
+
+    #[test]
     fn a_cancelled_capture_brings_a_visible_window_back() {
         // ...but a cancel must still restore the window the user was looking
         // at before the capture started: the menu-driven captures hide it, and
@@ -1871,10 +2026,13 @@ mod tests {
         worker.capture(CaptureMode::Region, 0);
 
         assert!(window.is_visible(), "the window was not shown");
+        // WIN1: a window already in the tray is not hidden again for the
+        // capture (it is not on screen, and nothing waits 200 ms for it), so
+        // only the test's own hide is counted.
         assert_eq!(
             window.hide_count(),
-            2,
-            "the test's own hide plus the capture's hide should both be counted"
+            1,
+            "a window already in the tray was hidden again"
         );
         let events: Vec<UiEvent> = events.try_iter().collect();
         assert!(

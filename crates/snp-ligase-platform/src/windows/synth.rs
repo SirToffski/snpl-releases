@@ -1,20 +1,20 @@
 //! Synthetic input and desktop queries for the `--debug-overlay` self-check
 //! (NEXT_STEPS section 4.3).
 //!
-//! These are the only functions in the program that move the cursor or press
-//! keys without a human doing it, so they exist for the self-check alone and
+//! These functions move the cursor and post input to our foreground overlay,
+//! so they exist for the self-check alone and
 //! the self-check refuses to run while somebody is using the machine (see
 //! [`last_input_seconds`]).
 
 use std::time::Duration;
 
-use ::windows::Win32::Foundation::{HWND, LPARAM, POINT, TRUE};
+use ::windows::Win32::Foundation::{HWND, LPARAM, POINT, TRUE, WPARAM};
 use ::windows::Win32::System::SystemInformation::GetTickCount64;
-use ::windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetLastInputInfo, KEYBD_EVENT_FLAGS, LASTINPUTINFO, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
-    MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, VK_ESCAPE, keybd_event, mouse_event,
+use ::windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO, VK_ESCAPE};
+use ::windows::Win32::UI::WindowsAndMessaging::{
+    EnumWindows, GetClassNameW, GetForegroundWindow, GetWindowThreadProcessId, PostMessageW,
+    SetCursorPos, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN,
 };
-use ::windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, SetCursorPos};
 use ::windows::core::BOOL;
 
 /// How long ago the last keyboard or mouse input was, in seconds.
@@ -48,12 +48,13 @@ pub fn last_input_seconds() -> Option<f64> {
 pub fn drag(from: (i32, i32), to: (i32, i32), steps: u32) -> bool {
     let steps = steps.max(1);
 
-    // Safety: cursor and button injection; nothing here can be expressed in
-    // safe Rust, and the caller has already checked that nobody is typing.
-    unsafe {
+    // Every move and message independently checks our foreground window.
+    {
         let mut held = false;
         for _ in 0..20 {
-            SetCursorPos(from.0, from.1).ok();
+            if !move_cursor(from) {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(25));
             if cursor_pos() == from {
                 held = true;
@@ -64,7 +65,9 @@ pub fn drag(from: (i32, i32), to: (i32, i32), steps: u32) -> bool {
             return false;
         }
 
-        mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+        if !post_input(WM_LBUTTONDOWN, 0) {
+            return false;
+        }
         // Let the overlay process the press before moving: it reads the real
         // cursor when the button goes down, and a move first would make the
         // selection start at the first step instead of where the drag began.
@@ -72,11 +75,15 @@ pub fn drag(from: (i32, i32), to: (i32, i32), steps: u32) -> bool {
         for step in 1..=steps {
             let x = from.0 + (to.0 - from.0) * step as i32 / steps as i32;
             let y = from.1 + (to.1 - from.1) * step as i32 / steps as i32;
-            SetCursorPos(x, y).ok();
+            if !move_cursor((x, y)) {
+                return false;
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         std::thread::sleep(Duration::from_millis(80));
-        mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        if !post_input(WM_LBUTTONUP, 0) {
+            return false;
+        }
     }
     true
 }
@@ -92,40 +99,54 @@ pub fn cursor_pos() -> (i32, i32) {
     (point.x, point.y)
 }
 
-/// Presses and releases Escape.
-pub fn press_escape() {
-    // Safety: key injection; see [`drag`].
-    unsafe {
-        keybd_event(VK_ESCAPE.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-        std::thread::sleep(Duration::from_millis(50));
-        keybd_event(
-            VK_ESCAPE.0 as u8,
-            0,
-            KEYBD_EVENT_FLAGS(KEYBD_EVENT_FLAGS_KEYUP),
-            0,
-        );
-    }
+/// Posts Escape to our foreground overlay.
+pub fn press_escape() -> bool {
+    post_input(WM_KEYDOWN, VK_ESCAPE.0 as usize)
 }
 
-/// The `KEYEVENTF_KEYUP` flag: 2.
-const KEYBD_EVENT_FLAGS_KEYUP: u32 = 2;
-
-/// Presses and releases the right mouse button.
-pub fn right_click() {
-    // Safety: button injection; see [`drag`].
-    unsafe {
-        mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
-        std::thread::sleep(Duration::from_millis(50));
-        mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
-    }
+/// Posts a right click to our foreground overlay (it closes on button down).
+pub fn right_click() -> bool {
+    post_input(WM_RBUTTONDOWN, 0)
 }
 
 /// Moves the cursor to `at` and leaves the buttons alone.
-pub fn move_cursor(at: (i32, i32)) {
-    // Safety: cursor injection; see [`drag`].
+pub fn move_cursor(at: (i32, i32)) -> bool {
+    with_foreground_overlay(foreground_overlay, |_| unsafe {
+        SetCursorPos(at.0, at.1).is_ok()
+    })
+}
+
+/// Window-targeted messages exercise the real overlay procedure without
+/// leaving a global key/button held if the overlay closes or loses focus.
+fn post_input(message: u32, key: usize) -> bool {
+    with_foreground_overlay(foreground_overlay, |hwnd| unsafe {
+        PostMessageW(Some(hwnd), message, WPARAM(key), LPARAM(0)).is_ok()
+    })
+}
+
+fn foreground_overlay() -> Option<HWND> {
+    let hwnd = unsafe { GetForegroundWindow() };
+    let mut name = [0u16; 128];
+    let length = unsafe { GetClassNameW(hwnd, &mut name) };
+    let mut pid = 0;
     unsafe {
-        SetCursorPos(at.0, at.1).ok();
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
     }
+    (length > 0
+        && pid == std::process::id()
+        && String::from_utf16_lossy(&name[..length as usize]) == super::overlay::OVERLAY_CLASS)
+        .then_some(hwnd)
+}
+
+fn with_foreground_overlay(
+    foreground: impl FnOnce() -> Option<HWND>,
+    inject: impl FnOnce(HWND) -> bool,
+) -> bool {
+    let Some(hwnd) = foreground() else {
+        tracing::warn!("overlay is not the foreground window; input skipped");
+        return false;
+    };
+    inject(hwnd)
 }
 
 /// How many windows of `class` exist right now.
@@ -166,6 +187,24 @@ pub fn windows_with_class(class: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win3_every_input_checks_foreground_and_skips_after_focus_loss() {
+        let hwnd = HWND(1usize as _);
+        let mut sent = 0;
+        for foreground in [Some(hwnd), None, Some(hwnd), None] {
+            let result = with_foreground_overlay(
+                || foreground,
+                |target| {
+                    assert_eq!(target, hwnd);
+                    sent += 1;
+                    true
+                },
+            );
+            assert_eq!(result, foreground.is_some());
+        }
+        assert_eq!(sent, 2);
+    }
 
     #[test]
     fn the_last_input_time_is_readable() {

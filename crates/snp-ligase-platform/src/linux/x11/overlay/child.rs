@@ -4,7 +4,7 @@
 //! The parent ([`super`]) writes the frozen frames and the layout, then runs
 //! this binary again with `--overlay <dir>`. This module reads them, opens one
 //! borderless window per monitor with winit, paints them with `softbuffer`,
-//! feeds the input events to the pure state machine ([`super::state`]) and the
+//! feeds the input events to the pure state machine ([`crate::selection`]) and the
 //! pixels to the pure painter ([`super::paint`]), and prints **one JSON line**
 //! on stdout when the user decides.
 //!
@@ -18,7 +18,7 @@
 //!
 //! Everything that is not winit is elsewhere: the geometry is [`super::paint`]'s
 //! and [`super::paint`] is tested pixel by pixel; the decisions are
-//! [`super::state`]'s and it is tested event by event.
+//! [`crate::selection`]'s and it is tested event by event.
 
 use std::cell::Cell;
 use std::io::Write as _;
@@ -45,9 +45,9 @@ use x11rb::protocol::xproto::{self, EventMask, GrabMode, GrabStatus, InputFocus}
 use x11rb::rust_connection::RustConnection;
 
 use super::paint::{self, Frame};
-use super::state::{Outcome, SelectionState};
 use super::{Answer, Layout, LayoutMonitor, OVERLAY_CLASS, VisibleMarker, unix_ms};
 use crate::RectI;
+use crate::selection::{Outcome, SelectionState};
 
 /// How often a window that would not paint is asked again before the child
 /// gives up on it. A window that never becomes paintable is a broken run, and

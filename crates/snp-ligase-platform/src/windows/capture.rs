@@ -15,14 +15,19 @@
 //! bytes; we own everything above that: pixel format choice, pitch handling,
 //! conversion and diagnostics.
 
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use ::windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
-    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC,
-    SRCCOPY, SelectObject,
+    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HDC, HGDIOBJ,
+    ReleaseDC, SRCCOPY, SelectObject,
+};
+use ::windows::Win32::UI::WindowsAndMessaging::{
+    CURSOR_SHOWING, CURSORINFO, DI_NORMAL, DrawIconEx, GetCursorInfo, GetIconInfo, HICON, ICONINFO,
 };
 use half::f16;
 use image::RgbaImage;
@@ -45,6 +50,55 @@ use crate::{
 /// How long to wait for a Windows.Graphics.Capture frame before falling back to
 /// GDI (SPEC section 5.4).
 const WGC_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// How long a capture waits for the previous WGC worker on the same monitor to
+/// finish its teardown before giving up on WGC for that monitor. A worker sends
+/// its frame before the session closes, so back-to-back captures can find it
+/// still alive for a moment; falling back to GDI then would cost an HDR monitor
+/// its colours for no reason.
+const WGC_REUSE_GRACE: Duration = Duration::from_millis(250);
+
+// Keep the actual thread handle, not the result channel: a worker can send a
+// frame and then hang during session teardown. Only thread exit allows reuse.
+static WGC_WORKERS: LazyLock<Mutex<HashMap<String, thread::JoinHandle<()>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn start_wgc(
+    workers: &Mutex<HashMap<String, thread::JoinHandle<()>>>,
+    id: &str,
+    grace: Duration,
+    capture: impl FnOnce(Sender<Outcome>) + Send + 'static,
+) -> std::result::Result<Option<Receiver<Outcome>>, String> {
+    let deadline = Instant::now() + grace;
+    let mut workers = loop {
+        let workers = workers
+            .lock()
+            .map_err(|err| format!("WGC worker lock: {err}"))?;
+        let busy = workers
+            .get(id)
+            .is_some_and(|previous| !previous.is_finished());
+        if !busy {
+            break workers;
+        }
+        drop(workers);
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        thread::sleep(Duration::from_millis(5));
+    };
+    if let Some(previous) = workers.remove(id)
+        && previous.join().is_err()
+    {
+        tracing::warn!(monitor = id, "previous WGC worker panicked");
+    }
+    let (sender, receiver) = mpsc::channel();
+    let worker = thread::Builder::new()
+        .name(format!("capture-{id}"))
+        .spawn(move || capture(sender))
+        .map_err(|err| format!("could not start a capture thread: {err}"))?;
+    workers.insert(id.to_owned(), worker);
+    Ok(Some(receiver))
+}
 
 /// What one capture thread hands back: pixels, or a reason it could not.
 ///
@@ -79,24 +133,24 @@ pub(crate) fn capture_all(
 
     let mut receivers = Vec::with_capacity(infos.len());
     for (monitor, info) in raw.iter().zip(infos.iter()) {
-        let (sender, receiver) = mpsc::channel();
         let thread_monitor = monitor.clone();
         let thread_info = info.clone();
         let opts = *opts;
 
-        let spawned = thread::Builder::new()
-            .name(format!("capture-{}", info.id))
-            .spawn(move || capture_monitor(thread_monitor, thread_info, opts, sender));
-
-        if let Err(err) = spawned {
-            // The sender is dropped with this scope, so the receiver below sees
-            // a closed channel and the monitor falls back to GDI.
-            tracing::warn!(
-                monitor = %info.id,
-                error = %err,
-                "could not start a capture thread; using the fallback"
-            );
-        }
+        let receiver = match start_wgc(&WGC_WORKERS, &info.id, WGC_REUSE_GRACE, move |sender| {
+            capture_monitor(thread_monitor, thread_info, opts, sender);
+        }) {
+            Ok(Some(receiver)) => Some(receiver),
+            Ok(None) => {
+                tracing::warn!(monitor = %info.id,
+                    "previous WGC thread is still alive; skipping WGC and using GDI");
+                None
+            }
+            Err(err) => {
+                tracing::warn!(monitor = %info.id, error = %err, "using the GDI fallback");
+                None
+            }
+        };
 
         receivers.push(receiver);
     }
@@ -104,9 +158,10 @@ pub(crate) fn capture_all(
     let mut frames = Vec::with_capacity(infos.len());
     for (info, receiver) in infos.iter().zip(receivers) {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let outcome = match receiver.recv_timeout(remaining) {
-            Ok(outcome) => outcome,
-            Err(RecvTimeoutError::Timeout) => {
+        let outcome = match receiver.map(|receiver| receiver.recv_timeout(remaining)) {
+            None => Err(String::new()),
+            Some(Ok(outcome)) => outcome,
+            Some(Err(RecvTimeoutError::Timeout)) => {
                 tracing::warn!(
                     monitor = %info.id,
                     timeout_ms = WGC_TIMEOUT.as_millis(),
@@ -114,7 +169,7 @@ pub(crate) fn capture_all(
                 );
                 Err(String::new())
             }
-            Err(RecvTimeoutError::Disconnected) => {
+            Some(Err(RecvTimeoutError::Disconnected)) => {
                 tracing::warn!(
                     monitor = %info.id,
                     "the capture thread ended without reporting; falling back to GDI"
@@ -129,7 +184,7 @@ pub(crate) fn capture_all(
                 if !message.is_empty() {
                     tracing::warn!(monitor = %info.id, error = %message, "capture failed; falling back to GDI");
                 }
-                gdi_frame(raw, info, started)?
+                gdi_frame(raw, info, opts.include_cursor, started)?
             }
         };
         frames.push(frame);
@@ -449,7 +504,7 @@ pub(crate) fn size_mismatch(frame: (u32, u32), monitor: (u32, u32)) -> bool {
 ///
 /// The screen DC spans the whole virtual desktop, so a monitor at negative
 /// coordinates is just a `BitBlt` at that origin.
-fn capture_with_gdi(rect: RectI) -> Result<(Vec<u8>, u32, u32)> {
+fn capture_with_gdi(rect: RectI, include_cursor: bool) -> Result<(Vec<u8>, u32, u32)> {
     if rect.w <= 0 || rect.h <= 0 {
         return Err(Error::Capture {
             message: format!("monitor rectangle {rect:?} is empty"),
@@ -486,67 +541,87 @@ fn capture_with_gdi(rect: RectI) -> Result<(Vec<u8>, u32, u32)> {
         });
     }
 
-    let previous = unsafe { SelectObject(memory, bitmap.into()) };
-    let blit = unsafe {
-        BitBlt(
-            memory,
-            0,
-            0,
-            width,
-            height,
-            Some(screen),
-            rect.x,
-            rect.y,
-            // CAPTUREBLT so layered windows (menus, tooltips) are included in
-            // the fallback frame (R26, SPEC M5's human check).
-            SRCCOPY | CAPTUREBLT,
-        )
-    };
+    // The closure keeps every failure on the common resource-cleanup path.
+    let captured = (|| -> Result<Vec<u8>> {
+        let previous = checked_selection(unsafe { SelectObject(memory, bitmap.into()) })?;
+        unsafe {
+            BitBlt(
+                memory,
+                0,
+                0,
+                width,
+                height,
+                Some(screen),
+                rect.x,
+                rect.y,
+                // CAPTUREBLT so layered windows (menus, tooltips) are included in
+                // the fallback frame (R26, SPEC M5's human check).
+                SRCCOPY | CAPTUREBLT,
+            )
+        }
+        .map_err(|err| Error::Capture {
+            message: format!("BitBlt failed: {err}"),
+        })?;
+        // A cursor that cannot be drawn costs the cursor, never the frame: GDI
+        // is the last way to get a screenshot at all.
+        if include_cursor && let Err(err) = draw_cursor(memory, rect) {
+            tracing::warn!(error = %err, "could not draw the cursor into the GDI frame; capturing without it");
+        }
 
-    let mut pixels = vec![0u8; byte_count];
-    let mut header = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).unwrap_or(0),
-            biWidth: width,
-            biHeight: -height, // negative: rows come back top-down, no flipping
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            biSizeImage: byte_count as u32,
-            ..Default::default()
-        },
-        bmiColors: [Default::default(); 1],
-    };
-    let lines = unsafe {
-        GetDIBits(
-            memory,
-            bitmap,
-            0,
-            height as u32,
-            Some(pixels.as_mut_ptr().cast()),
-            &raw mut header,
-            DIB_RGB_COLORS,
-        )
-    };
+        // GetDIBits requires this bitmap to be deselected from every DC.
+        checked_selection(unsafe { SelectObject(memory, previous) })?;
 
-    // Undo every selection before freeing anything.
+        let mut pixels = vec![0u8; byte_count];
+        let mut header = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: u32::try_from(std::mem::size_of::<BITMAPINFOHEADER>()).unwrap_or(0),
+                biWidth: width,
+                biHeight: -height, // negative: rows come back top-down, no flipping
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: byte_count as u32,
+                ..Default::default()
+            },
+            bmiColors: [Default::default(); 1],
+        };
+        let lines = unsafe {
+            // Catch regressions in the Win32 contract in debug/self-check runs.
+            debug_assert_ne!(
+                ::windows::Win32::Graphics::Gdi::GetCurrentObject(
+                    memory,
+                    ::windows::Win32::Graphics::Gdi::OBJ_BITMAP
+                ),
+                bitmap.into(),
+                "GetDIBits requires a deselected bitmap",
+            );
+            GetDIBits(
+                memory,
+                bitmap,
+                0,
+                height as u32,
+                Some(pixels.as_mut_ptr().cast()),
+                &raw mut header,
+                DIB_RGB_COLORS,
+            )
+        };
+
+        if lines != height {
+            return Err(Error::Capture {
+                message: format!("GetDIBits copied {lines} of {height} rows"),
+            });
+        }
+        Ok(pixels)
+    })();
+
+    // Destroy the memory DC first: even a failed restoration or draw must not
+    // leave the bitmap selected when DeleteObject runs.
     unsafe {
-        let _ = SelectObject(memory, previous);
-        let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(memory);
+        let _ = DeleteObject(bitmap.into());
         let _ = ReleaseDC(None, screen);
     }
-
-    if let Err(err) = blit {
-        return Err(Error::Capture {
-            message: format!("BitBlt failed: {err}"),
-        });
-    }
-    if lines != height {
-        return Err(Error::Capture {
-            message: format!("GetDIBits copied {lines} of {height} rows"),
-        });
-    }
+    let mut pixels = captured?;
 
     // GetDIBits hands back BGRA with an unused alpha byte.
     for pixel in pixels.as_chunks_mut::<4>().0 {
@@ -557,8 +632,78 @@ fn capture_with_gdi(rect: RectI) -> Result<(Vec<u8>, u32, u32)> {
     Ok((pixels, width as u32, height as u32))
 }
 
+fn checked_selection(previous: HGDIOBJ) -> Result<HGDIOBJ> {
+    if previous.is_invalid() {
+        Err(Error::Capture {
+            message: "SelectObject failed in GDI capture".to_owned(),
+        })
+    } else {
+        Ok(previous)
+    }
+}
+
+fn cursor_origin(position: (i32, i32), hotspot: (u32, u32), rect: RectI) -> (i32, i32) {
+    (
+        position.0 - rect.x - hotspot.0 as i32,
+        position.1 - rect.y - hotspot.1 as i32,
+    )
+}
+
+fn draw_cursor(memory: HDC, rect: RectI) -> Result<()> {
+    let mut cursor = CURSORINFO {
+        cbSize: size_of::<CURSORINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetCursorInfo(&mut cursor) }.map_err(|err| Error::Capture {
+        message: format!("GetCursorInfo failed: {err}"),
+    })?;
+    if cursor.flags.0 & CURSOR_SHOWING.0 == 0 {
+        return Ok(());
+    }
+    let mut icon = ICONINFO::default();
+    unsafe { GetIconInfo(HICON(cursor.hCursor.0), &mut icon) }.map_err(|err| Error::Capture {
+        message: format!("GetIconInfo failed: {err}"),
+    })?;
+    let (x, y) = cursor_origin(
+        (cursor.ptScreenPos.x, cursor.ptScreenPos.y),
+        (icon.xHotspot, icon.yHotspot),
+        rect,
+    );
+    // DrawIconEx clips to this monitor's bitmap, including a cursor straddling
+    // an edge. GetIconInfo creates bitmaps owned by us; the cursor is borrowed.
+    let drawn = unsafe {
+        DrawIconEx(
+            memory,
+            x,
+            y,
+            HICON(cursor.hCursor.0),
+            0,
+            0,
+            0,
+            None,
+            DI_NORMAL,
+        )
+    };
+    unsafe {
+        if !icon.hbmMask.is_invalid() {
+            let _ = DeleteObject(icon.hbmMask.into());
+        }
+        if !icon.hbmColor.is_invalid() {
+            let _ = DeleteObject(icon.hbmColor.into());
+        }
+    }
+    drawn.map_err(|err| Error::Capture {
+        message: format!("DrawIconEx failed: {err}"),
+    })
+}
+
 /// Builds the GDI fallback frame for one monitor.
-fn gdi_frame(raw: &[RawMonitor], info: &MonitorInfo, started: Instant) -> Result<MonitorFrame> {
+fn gdi_frame(
+    raw: &[RawMonitor],
+    info: &MonitorInfo,
+    include_cursor: bool,
+    started: Instant,
+) -> Result<MonitorFrame> {
     let monitor = raw
         .iter()
         .find(|monitor| monitor.device_name == info.id)
@@ -566,7 +711,7 @@ fn gdi_frame(raw: &[RawMonitor], info: &MonitorInfo, started: Instant) -> Result
             message: format!("no monitor named {}", info.id),
         })?;
 
-    let (pixels, width, height) = capture_with_gdi(monitor.rect)?;
+    let (pixels, width, height) = capture_with_gdi(monitor.rect, include_cursor)?;
     let image = RgbaImage::from_raw(width, height, pixels).ok_or_else(|| Error::Capture {
         message: "GDI pixels did not fit the monitor rectangle".to_owned(),
     })?;
@@ -574,6 +719,7 @@ fn gdi_frame(raw: &[RawMonitor], info: &MonitorInfo, started: Instant) -> Result
     tracing::warn!(
         monitor = %info.id,
         hdr = info.hdr_active,
+        include_cursor,
         "using the GDI fallback; colours may be wrong on an HDR monitor"
     );
 
@@ -603,6 +749,171 @@ fn gdi_frame(raw: &[RawMonitor], info: &MonitorInfo, started: Instant) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win3_timed_out_wgc_worker_stays_registered_until_thread_exit() {
+        let workers = Mutex::new(HashMap::new());
+        let (finish, wait) = mpsc::channel();
+        let receiver = start_wgc(&workers, "timed-out", Duration::ZERO, move |_sender| {
+            wait.recv().unwrap();
+        })
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(10)),
+            Err(RecvTimeoutError::Timeout)
+        ));
+        assert!(
+            start_wgc(&workers, "timed-out", Duration::ZERO, |_| panic!(
+                "second live session"
+            ))
+            .unwrap()
+            .is_none()
+        );
+        finish.send(()).unwrap();
+        for (_, handle) in workers.into_inner().unwrap() {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn win3_live_wgc_worker_blocks_replacement_even_after_sending_a_result() {
+        let workers = Mutex::new(HashMap::new());
+        let (finish, wait) = mpsc::channel();
+        let first = start_wgc(&workers, "monitor-a", Duration::ZERO, move |sender| {
+            sender.send(Err("first result".to_owned())).unwrap();
+            wait.recv().unwrap(); // Model a session stuck in teardown.
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .err()
+                .as_deref(),
+            Some("first result")
+        );
+        for _ in 0..8 {
+            assert!(
+                start_wgc(&workers, "monitor-a", Duration::ZERO, |_| panic!(
+                    "second live session"
+                ))
+                .unwrap()
+                .is_none()
+            );
+        }
+        let other = start_wgc(&workers, "monitor-b", Duration::ZERO, |sender| {
+            sender.send(Err("other monitor".to_owned())).unwrap();
+        })
+        .unwrap()
+        .unwrap();
+        assert!(other.recv_timeout(Duration::from_secs(2)).is_ok());
+        finish.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !workers.lock().unwrap()["monitor-a"].is_finished() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let next = start_wgc(&workers, "monitor-a", Duration::ZERO, |sender| {
+            sender.send(Err("fresh session".to_owned())).unwrap();
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            next.recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .err()
+                .as_deref(),
+            Some("fresh session")
+        );
+        for (_, handle) in workers.into_inner().unwrap() {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_worker_finishing_its_teardown_within_the_grace_is_reused() {
+        let workers = Mutex::new(HashMap::new());
+        let first = start_wgc(&workers, "monitor-a", Duration::ZERO, |sender| {
+            sender.send(Err("first".to_owned())).unwrap();
+            thread::sleep(Duration::from_millis(50)); // Session teardown.
+        })
+        .unwrap()
+        .unwrap();
+        assert!(first.recv_timeout(Duration::from_secs(2)).is_ok());
+        let next = start_wgc(&workers, "monitor-a", Duration::from_secs(5), |sender| {
+            sender.send(Err("second".to_owned())).unwrap();
+        })
+        .unwrap()
+        .expect("a worker that finished within the grace must not force GDI");
+        assert_eq!(
+            next.recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .err()
+                .as_deref(),
+            Some("second")
+        );
+        for (_, handle) in workers.into_inner().unwrap() {
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn win3_gdi_rejects_both_select_object_failure_values() {
+        assert!(checked_selection(HGDIOBJ::default()).is_err());
+        assert!(checked_selection(HGDIOBJ(-1isize as _)).is_err());
+        assert!(checked_selection(HGDIOBJ(1usize as _)).is_ok());
+    }
+
+    #[test]
+    fn win3_cursor_uses_monitor_origin_and_hotspot_including_negative_origins() {
+        assert_eq!(
+            cursor_origin((-1900, 100), (5, 7), RectI::new(-1920, 0, 1920, 1080)),
+            (15, 93)
+        );
+        // Keep negative local coordinates: DrawIconEx clips cursors on seams.
+        assert_eq!(
+            cursor_origin((1921, 2), (5, 7), RectI::new(1920, 0, 1920, 1080)),
+            (-4, -5)
+        );
+    }
+
+    #[test]
+    #[ignore = "reads the real desktop; run explicitly for WIN3"]
+    fn win3_real_gdi_capture_with_and_without_cursor() {
+        let raw = super::super::monitors::enumerate().unwrap();
+        assert!(!raw.is_empty());
+        for monitor in raw {
+            for include_cursor in [false, true] {
+                let (pixels, width, height) =
+                    capture_with_gdi(monitor.rect, include_cursor).unwrap();
+                assert_eq!(
+                    (width, height),
+                    (monitor.rect.w as u32, monitor.rect.h as u32)
+                );
+                assert_eq!(pixels.len(), width as usize * height as usize * 4);
+                assert!(
+                    pixels
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .all(|pixel| pixel[3] == 255)
+                );
+                assert!(
+                    pixels
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .any(|pixel| pixel[..3] != [0, 0, 0])
+                );
+                println!(
+                    "GDI {} {}x{} cursor={include_cursor}: valid opaque pixels",
+                    monitor.device_name, width, height
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_frame_of_the_monitors_own_size_is_not_a_mismatch() {

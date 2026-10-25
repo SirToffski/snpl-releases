@@ -11,6 +11,7 @@ mod canvas;
 mod clipboard;
 mod controller;
 mod debug_capture;
+mod explorer;
 // The overlay's self-check: the Win32 overlay on Windows, the X11 one on Linux
 // (LINUX_SUPPORT.md section 4, phase L1b). The variant names and the reporting
 // are the same file; the run belongs to the platform.
@@ -250,6 +251,7 @@ fn run(app_name: &str, paths: paths::Paths) -> anyhow::Result<ExitCode> {
             let capture_settings = controller::CaptureSettings {
                 copy_new_captures: store.settings().copy_new_captures,
                 hide_while_capturing: store.settings().hide_while_capturing,
+                show_editor_after_capture: store.settings().show_editor_after_capture,
                 include_cursor: store.settings().include_cursor,
                 hdr_highlights: store.settings().hdr_highlights,
                 sdr_white_nits: store.settings().sdr_white_nits,

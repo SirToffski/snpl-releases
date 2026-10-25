@@ -48,10 +48,10 @@ use super::paint::{self, Frame};
 use crate::RectI;
 use crate::downscale_rgba;
 use crate::linux::x11::overlay::paint::{dim, pixels_from_rgba};
-use crate::linux::x11::overlay::state::{Outcome, SelectionState};
 use crate::linux::x11::overlay::{
     Answer, Layout, LayoutMonitor, VisibleMarker, read_layout, unix_ms,
 };
+use crate::selection::{Outcome, SelectionState};
 
 /// How often a window that would not paint is asked again before the child
 /// gives up on it. A window that never becomes paintable is a broken run,

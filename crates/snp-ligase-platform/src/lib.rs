@@ -19,6 +19,7 @@ use image::RgbaImage;
 pub mod instance;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod selection;
 #[cfg(windows)]
 pub mod windows;
 

@@ -465,6 +465,9 @@ impl RecorderInput {
 /// What a finished recording decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recorded {
+    /// A named key the native hotkey backend cannot register correctly.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Rejected(&'static str),
     /// The first non-modifier key went down: use this combination.
     Hotkey(HotKey),
     /// Backspace or Delete alone: the field becomes empty ("None").
@@ -512,6 +515,10 @@ impl Recorder {
                 continue;
             };
             outcome = Some(match code {
+                #[cfg(windows)]
+                Code::NumpadEqual => Recorded::Rejected(
+                    "Numpad Equal cannot be used on Windows: the hotkey backend registers it as the E key. Choose another key.",
+                ),
                 Code::Escape => Recorded::Cancel,
                 Code::Backspace | Code::Delete if input.modifiers().is_empty() => Recorded::Clear,
                 other => Recorded::Hotkey(HotKey::new(Some(input.modifiers()), other)),
@@ -1240,6 +1247,15 @@ mod tests {
             win,
             keys: keys.to_vec(),
         }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn win3_numpad_equal_is_refused_with_a_reason() {
+        let mut recorder = Recorder::new(Vec::new());
+        let result = recorder.update(&input(&[0x92], true, false, false, false));
+        assert!(matches!(result, Some(Recorded::Rejected(reason))
+            if reason.contains("Numpad Equal") && reason.contains("E key")));
     }
 
     #[test]

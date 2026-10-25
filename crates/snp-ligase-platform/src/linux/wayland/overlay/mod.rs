@@ -10,7 +10,7 @@
 //! virtual space by [`map`].
 //!
 //! Everything the user decides still goes through the shared pure state
-//! machine ([`crate::linux::x11::overlay::state`]); the child only turns
+//! machine ([`crate::selection`]); the child only turns
 //! Wayland events into calls, with coordinates mapped ([`map`]).
 //!
 //! The Linux safety nets need no copy of their own to be listed in a design:

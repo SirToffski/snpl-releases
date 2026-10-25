@@ -113,6 +113,23 @@ fn capture(ui: &mut Ui, draft: &mut Settings, capabilities: &Capabilities) {
         hide.on_disabled_hover_text(HIDE_WINDOW_UNAVAILABLE);
     }
 
+    let show_editor = ui.add_enabled(
+        cfg!(windows),
+        egui::Checkbox::new(
+            &mut draft.show_editor_after_capture,
+            "Show editor after capture",
+        ),
+    );
+    if cfg!(windows) {
+        show_editor.on_hover_text(
+            "Bring the editor to the front after every capture, even from the taskbar or the              tray. Off: the window stays as it was; the capture is still copied and saved.",
+        );
+    } else {
+        show_editor.on_disabled_hover_text(
+            "Not configurable on Linux yet: the editor is shown after every capture.",
+        );
+    }
+
     let cursor = ui.add_enabled(
         capabilities.capture_cursor,
         egui::Checkbox::new(

@@ -120,6 +120,7 @@ pub enum Action {
     Save,
     SaveAs,
     SaveAll,
+    ShowInExplorer(usize),
     CopyImage,
     CloseTab(usize),
     CloseAllTabs,
@@ -344,6 +345,7 @@ pub enum StyleProperty {
 /// What the menus need to know about the current state.
 #[derive(Debug, Clone)]
 pub struct MenuState {
+    pub explorer_blocked: Option<&'static str>,
     pub can_undo: bool,
     pub can_redo: bool,
     pub has_tab: bool,
@@ -505,6 +507,7 @@ fn file(ui: &mut Ui, state: &MenuState, actions: &mut Vec<Action>) {
         actions,
     );
     item(ui, "Save All", "", Action::SaveAll, state.has_tab, actions);
+    show_in_explorer(ui, state.active_tab, state.explorer_blocked, actions);
     item(
         ui,
         "Copy Image to Clipboard",
@@ -1347,6 +1350,14 @@ pub fn tab_strip(ui: &mut Ui, tabs: &[Tab], active: usize, actions: &mut Vec<Act
                         if response.middle_clicked() {
                             actions.push(Action::CloseTab(index));
                         }
+                        response.context_menu(|ui| {
+                            show_in_explorer(
+                                ui,
+                                index,
+                                crate::explorer::blocked(tab.path()),
+                                actions,
+                            );
+                        });
 
                         let close = ui
                             .add(egui::Button::new("×").min_size(egui::vec2(18.0, 18.0)))
@@ -1358,6 +1369,19 @@ pub fn tab_strip(ui: &mut Ui, tabs: &[Tab], active: usize, actions: &mut Vec<Act
                 });
             });
     });
+}
+
+/// Both menus reveal their own tab, including an inactive right-clicked tab.
+fn show_in_explorer(ui: &mut Ui, index: usize, blocked: Option<&str>, actions: &mut Vec<Action>) {
+    let response = ui.add_enabled(blocked.is_none(), egui::Button::new("Show in Explorer"));
+    let response = match blocked {
+        Some(reason) => response.on_disabled_hover_text(reason),
+        None => response.on_hover_text("Open Explorer with this file selected"),
+    };
+    if response.clicked() {
+        actions.push(Action::ShowInExplorer(index));
+        ui.close();
+    }
 }
 
 /// The status bar (SPEC 8.2): size, zoom, cursor position, and any message.
@@ -1609,6 +1633,66 @@ mod tests {
         );
     }
 
+    /// WIN3: the File row is disabled without an existing saved file.
+    #[test]
+    fn win3_file_menu_reveals_the_active_saved_tab_only() {
+        use egui_kittest::kittest::Queryable as _;
+        for has_file in [false, true] {
+            let mut menu_state = state(Vec::new(), false);
+            menu_state.active_tab = 3;
+            menu_state.explorer_blocked =
+                crate::explorer::blocked(has_file.then_some(std::path::Path::new("Cargo.toml")));
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                move |ui, actions: &mut Vec<Action>| menu_bar(ui, &menu_state, actions),
+                Vec::new(),
+            );
+            harness.run();
+            harness.get_by_label("File").click();
+            harness.run();
+            harness.get_by_label("Show in Explorer").click();
+            harness.run();
+            assert_eq!(
+                harness.state().contains(&Action::ShowInExplorer(3)),
+                has_file && cfg!(windows)
+            );
+        }
+    }
+
+    #[test]
+    fn win3_tab_context_menu_targets_the_clicked_tab_without_switching() {
+        use egui_kittest::kittest::Queryable as _;
+        for has_file in [false, true] {
+            let document = || snp_ligase_core::model::Document::new(image::RgbaImage::new(10, 10));
+            let tabs = vec![
+                Tab::new(document(), "unsaved".to_owned()),
+                Tab::from_path(
+                    document(),
+                    std::path::PathBuf::from(if has_file {
+                        "Cargo.toml"
+                    } else {
+                        "win3-deleted.png"
+                    }),
+                ),
+            ];
+            let title = tabs[1].title();
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                move |ui, actions: &mut Vec<Action>| tab_strip(ui, &tabs, 0, actions),
+                Vec::new(),
+            );
+            harness.run();
+            harness.get_by_label(&title).click_secondary();
+            harness.run();
+            harness.get_by_label("Show in Explorer").click();
+            harness.run();
+            let expected = if has_file && cfg!(windows) {
+                vec![Action::ShowInExplorer(1)]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(*harness.state(), expected);
+        }
+    }
+
     /// NEXT_STEPS step 11: the File menu's "Paste Image into This Tab" row is a
     /// real action (SPEC 8.1 rule 2), and it is disabled with no tab open.
     #[test]
@@ -1759,6 +1843,7 @@ mod tests {
 
     fn state(nodes: Vec<StyleNode>, has_selection: bool) -> MenuState {
         MenuState {
+            explorer_blocked: Some("This tab has no file on disk."),
             can_undo: false,
             can_redo: false,
             has_tab: true,

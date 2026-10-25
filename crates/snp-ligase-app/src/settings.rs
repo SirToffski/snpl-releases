@@ -89,6 +89,10 @@ pub struct Settings {
     // -- Capture.
     /// Hide the window while a capture is being taken (default on).
     pub hide_while_capturing: bool,
+    /// Bring the editor to the front after a capture, restoring it from the
+    /// taskbar or the tray (default on, SPEC 6.3). Off: the window stays the
+    /// way it was before the capture. Windows only for now (WIN1).
+    pub show_editor_after_capture: bool,
     /// Include the mouse cursor in captures (default off).
     pub include_cursor: bool,
     /// What to do with values above SDR white on an HDR monitor.
@@ -168,6 +172,7 @@ impl Default for Settings {
             hotkey_active_window: hotkeys[2].clone(),
             hotkey_all_monitors: hotkeys[3].clone(),
             hide_while_capturing: true,
+            show_editor_after_capture: true,
             include_cursor: false,
             hdr_highlights: HdrHighlights::Clip,
             sdr_white_nits: None,
@@ -831,6 +836,17 @@ mod tests {
         } else {
             PathBuf::from("/tmp/Shots")
         }
+    }
+
+    /// WIN1: a config.toml written before "Show editor after capture" existed
+    /// (every 0.3.x install) loads it as on, the default.
+    #[test]
+    fn an_older_config_shows_the_editor_after_capture() {
+        let older: Settings =
+            toml::from_str("hide_while_capturing = true\ncopy_new_captures = true\n")
+                .expect("an older config.toml still parses");
+        assert!(older.show_editor_after_capture);
+        assert!(Settings::default().show_editor_after_capture);
     }
 
     #[test]

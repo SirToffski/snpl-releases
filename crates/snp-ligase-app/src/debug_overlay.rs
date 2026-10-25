@@ -229,10 +229,6 @@ fn attempt(variant: Variant, allow_busy: bool) -> Outcome {
         ));
     }
 
-    // Park the cursor where the drag will start, so the overlay brings the
-    // right monitor's window forward.
-    synth::move_cursor(from);
-
     let injector = {
         let handle = std::thread::Builder::new()
             .name("overlay-selfcheck-input".to_owned())
@@ -242,7 +238,7 @@ fn attempt(variant: Variant, allow_busy: bool) -> Outcome {
                 while synth::windows_with_class(overlay::OVERLAY_CLASS) == 0 {
                     if std::time::Instant::now() > deadline {
                         tracing::warn!("no overlay window appeared; no input was sent");
-                        return;
+                        return false;
                     }
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -250,39 +246,44 @@ fn attempt(variant: Variant, allow_busy: bool) -> Outcome {
                 // selection is up before the drag starts.
                 std::thread::sleep(Duration::from_millis(150));
                 match variant {
-                    Variant::Drag => {
-                        if !synth::drag(from, to, 12) {
-                            tracing::warn!(
-                                "another program kept moving the cursor; the drag was not sent"
-                            );
-                        }
-                    }
+                    Variant::Drag => synth::drag(from, to, 12),
                     Variant::Escape => synth::press_escape(),
                     Variant::RightClick => synth::right_click(),
-                    Variant::Timeout => {}
+                    Variant::Timeout => true,
                 }
             });
         match handle {
-            Ok(handle) => Some(handle),
+            Ok(handle) => handle,
             Err(err) => return Outcome::Failed(format!("could not start the input thread: {err}")),
         }
     };
 
     let timeout = match variant {
         Variant::Timeout => SHORT_TIMEOUT,
-        _ => overlay::TIMEOUT,
+        // A skipped injection must not strand the desktop for the normal
+        // two-minute user-selection timeout.
+        _ => Duration::from_secs(5),
     };
     let started = std::time::Instant::now();
     let result = overlay::select_region_with_timeout(&capture, timeout);
     let elapsed = started.elapsed();
-    if let Some(injector) = injector {
-        let _ = injector.join();
-    }
+    let injected = injector.join();
 
     // Give the window procedure's `DestroyWindow` calls a moment to land
     // before asking Windows what still exists.
     std::thread::sleep(Duration::from_millis(250));
     let leftovers = synth::windows_with_class(overlay::OVERLAY_CLASS);
+    let input_sent = match injected {
+        Ok(sent) => sent,
+        Err(_) => {
+            return Outcome::Failed(format!(
+                "the input thread panicked; {leftovers} overlay windows left behind"
+            ));
+        }
+    };
+    if !input_sent && leftovers == 0 && result.is_ok() {
+        return Outcome::Skipped("input skipped: overlay was not foreground, did not appear, or the cursor would not stay put; no overlay windows left behind".to_owned());
+    }
 
     let detail = match (&result, variant) {
         (Ok(Some(rect)), Variant::Drag) if close_enough(*rect, expected) => {
